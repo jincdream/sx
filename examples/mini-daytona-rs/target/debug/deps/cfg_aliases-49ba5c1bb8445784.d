@@ -1,0 +1,7 @@
+/work/target/debug/deps/cfg_aliases-49ba5c1bb8445784.d: /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cfg_aliases-0.2.1/src/lib.rs
+
+/work/target/debug/deps/libcfg_aliases-49ba5c1bb8445784.rlib: /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cfg_aliases-0.2.1/src/lib.rs
+
+/work/target/debug/deps/libcfg_aliases-49ba5c1bb8445784.rmeta: /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cfg_aliases-0.2.1/src/lib.rs
+
+/usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cfg_aliases-0.2.1/src/lib.rs:
