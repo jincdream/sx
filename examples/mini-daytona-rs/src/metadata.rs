@@ -1,7 +1,9 @@
 use serde::{Deserialize, Serialize};
+use chrono::Utc;
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
+use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnapshotMetadata {
@@ -19,12 +21,27 @@ pub struct SandboxMetadata {
     pub snapshot_id: String,
     pub created_at: String,
     pub dir: PathBuf,
+    /// PID of the sandbox init process (for nsenter-based exec)
+    #[serde(default)]
+    pub pid: Option<i32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BuildArtifactMetadata {
+    pub cache_key: String,
+    pub dockerfile_md5: String,
+    pub context_hash: String,
+    pub snapshot_path: PathBuf,
+    pub created_at: String,
+    pub last_used_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Metadata {
     pub snapshots: HashMap<String, SnapshotMetadata>,
     pub sandboxes: HashMap<String, SandboxMetadata>,
+    #[serde(default)]
+    pub build_artifacts: HashMap<String, BuildArtifactMetadata>,
 }
 
 pub fn get_metadata_dir() -> anyhow::Result<PathBuf> {
@@ -53,4 +70,52 @@ pub fn save_metadata(metadata: &Metadata) -> anyhow::Result<()> {
     let content = serde_json::to_string_pretty(metadata)?;
     fs::write(path, content)?;
     Ok(())
+}
+
+pub fn register_snapshot(
+    metadata: &mut Metadata,
+    path: PathBuf,
+    entrypoint: Option<Vec<String>>,
+    cmd: Option<Vec<String>>,
+    env: Option<Vec<String>>,
+) -> String {
+    let snapshot_id = Uuid::new_v4().to_string();
+    metadata.snapshots.insert(
+        snapshot_id.clone(),
+        SnapshotMetadata {
+            id: snapshot_id.clone(),
+            path,
+            created_at: Utc::now().to_rfc3339(),
+            entrypoint,
+            cmd,
+            env,
+        },
+    );
+    snapshot_id
+}
+
+pub fn touch_build_artifact(
+    metadata: &mut Metadata,
+    cache_key: String,
+    dockerfile_md5: String,
+    context_hash: String,
+    snapshot_path: PathBuf,
+) {
+    let now = Utc::now().to_rfc3339();
+    metadata
+        .build_artifacts
+        .entry(cache_key.clone())
+        .and_modify(|entry| {
+            entry.snapshot_path = snapshot_path.clone();
+            entry.context_hash = context_hash.clone();
+            entry.last_used_at = now.clone();
+        })
+        .or_insert(BuildArtifactMetadata {
+            cache_key,
+            dockerfile_md5,
+            context_hash,
+            snapshot_path,
+            created_at: now.clone(),
+            last_used_at: now,
+        });
 }

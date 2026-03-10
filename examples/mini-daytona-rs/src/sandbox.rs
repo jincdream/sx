@@ -1,71 +1,61 @@
-use nix::mount::{mount, MsFlags};
-use nix::sched::{clone, CloneFlags};
-use nix::sys::signal::Signal;
-use nix::sys::wait::waitpid;
-use nix::unistd::{chdir, chroot, execvp, sethostname};
-use std::ffi::CString;
-
-const STACK_SIZE: usize = 1024 * 1024;
-
-pub fn run_sandbox(merged_dir: &str, cmd: &[&str]) -> anyhow::Result<()> {
-    let mut stack = vec![0u8; STACK_SIZE];
-
-    let flags = CloneFlags::CLONE_NEWNS
-        | CloneFlags::CLONE_NEWPID
-        | CloneFlags::CLONE_NEWUTS
-        | CloneFlags::CLONE_NEWIPC
-        | CloneFlags::CLONE_NEWNET;
-
-    let merged_dir_c = CString::new(merged_dir)?;
-    let cmd_c: Vec<CString> = cmd.iter().map(|s| CString::new(*s).unwrap()).collect();
-
-    let child_pid = unsafe {
-        clone(
-            Box::new(|| {
-                if let Err(e) = child(merged_dir_c.as_c_str(), &cmd_c) {
-                    eprintln!("Child error: {}", e);
-                    return -1;
-                }
-                0
-            }),
-            &mut stack,
-            flags,
-            Some(Signal::SIGCHLD as i32),
-        )?
-    };
-
-    let _status = waitpid(child_pid, None)?;
-    Ok(())
+#![allow(unused)]
+/// Security profile that controls the isolation level of a sandbox.
+/// Build sandboxes need more privileges (e.g. apt-get, npm install).
+/// Runtime sandboxes are locked down for defense-in-depth.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum SandboxProfile {
+    /// Used during `docker build`-style operations. More permissive:
+    /// - Retains capabilities (setuid/setgroups for apt)
+    /// - Wider seccomp whitelist
+    /// - no_new_privs NOT set
+    Build,
+    /// Used when running user workloads (Chromium, Node, Python, etc.).
+    /// Locked down:
+    /// - Drops all capabilities
+    /// - Sets PR_SET_NO_NEW_PRIVS
+    /// - Narrower seccomp profile (runtime denylist applied on top)
+    /// - Extended /proc and /sys masking
+    Runtime,
 }
 
-fn child(merged_dir: &std::ffi::CStr, cmd: &[CString]) -> anyhow::Result<()> {
-    sethostname("mini-daytona")?;
-
-    mount(
-        None::<&str>,
-        "/",
-        None::<&str>,
-        MsFlags::MS_PRIVATE | MsFlags::MS_REC,
-        None::<&str>,
-    )?;
-
-    chroot(merged_dir)?;
-    chdir("/")?;
-
-    mount(
-        Some("proc"),
-        "/proc",
-        Some("proc"),
-        MsFlags::empty(),
-        None::<&str>,
-    )?;
-
-    if !cmd.is_empty() {
-        execvp(&cmd[0], cmd)?;
-    } else {
-        let sh = CString::new("/bin/sh")?;
-        execvp(&sh, std::slice::from_ref(&sh))?;
+impl Default for SandboxProfile {
+    fn default() -> Self {
+        SandboxProfile::Runtime
     }
-
-    Ok(())
 }
+
+/// Configurable resource limits for a sandbox (cgroups v2).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ResourceLimits {
+    /// Memory limit in bytes (default: 1 GiB)
+    #[serde(default)]
+    pub memory_bytes: Option<u64>,
+    /// CPU quota in microseconds per period (default: 100000 = 1 core)
+    #[serde(default)]
+    pub cpu_quota: Option<u64>,
+    /// CPU period in microseconds (default: 100000)
+    #[serde(default)]
+    pub cpu_period: Option<u64>,
+    /// Maximum number of PIDs (default: 512)
+    #[serde(default)]
+    pub pids_max: Option<u64>,
+    /// Disk space limit in bytes (default: 2 GiB, informational — not enforced via cgroups)
+    #[serde(default)]
+    pub disk_bytes: Option<u64>,
+}
+
+impl Default for ResourceLimits {
+    fn default() -> Self {
+        Self {
+            memory_bytes: Some(1_073_741_824),  // 1 GiB
+            cpu_quota: Some(100_000),            // 1 core
+            cpu_period: Some(100_000),
+            pids_max: Some(512),
+            disk_bytes: Some(2_147_483_648),     // 2 GiB
+        }
+    }
+}
+
+// Re-export the platform-specific run_sandbox at the module level
+pub use crate::os::sys::run_sandbox;
+

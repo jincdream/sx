@@ -1,20 +1,23 @@
 use clap::Parser;
-use chrono::Utc;
 use std::path::PathBuf;
-use uuid::Uuid;
 use anyhow::{Context, Result};
+use chrono::Utc;
 use tracing::{info, warn, error, debug};
 use tracing_subscriber::{EnvFilter, FmtSubscriber};
+use uuid::Uuid;
 
 mod build;
 mod metadata;
+mod netns;
 mod overlay;
 mod sandbox;
+mod os;
 mod snapshot;
 mod server;
 
 use build::build;
-use metadata::{load_metadata, save_metadata, SandboxMetadata, SnapshotMetadata};
+use build::cache::{list_build_artifacts, prune_build_artifacts, BuildCachePruneMode, BuildCacheScope};
+use metadata::{load_metadata, register_snapshot, save_metadata, SandboxMetadata};
 use overlay::OverlayMount;
 use sandbox::run_sandbox;
 use snapshot::{create_archive, extract_archive, get_sandboxes_dir};
@@ -48,12 +51,32 @@ enum Commands {
     },
     /// 列出所有快照与沙箱
     List,
+    /// 管理全局 build artifact 缓存
+    Cache {
+        #[command(subcommand)]
+        command: CacheCommands,
+    },
     /// 销毁指定的沙箱环境
     Destroy {
         sandbox_id: String,
     },
     /// 启动 API Server (3000端口)
     Server,
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum CacheCommands {
+    /// 列出 build artifact 缓存
+    List,
+    /// 清理 build artifact 缓存
+    Prune {
+        #[arg(long)]
+        dockerfile_md5: Option<String>,
+        #[arg(long)]
+        cache_key: Option<String>,
+    },
+    /// 清空所有 build artifact 缓存
+    Clear,
 }
 
 fn setup_logging(level: &Option<String>) {
@@ -87,18 +110,7 @@ fn main() -> Result<()> {
             info!("Snapshot created: {:?}", snapshot_path);
 
             let mut metadata = load_metadata().context("Failed to load metadata")?;
-            let snapshot_id = Uuid::new_v4().to_string();
-            metadata.snapshots.insert(
-                snapshot_id.clone(),
-                SnapshotMetadata {
-                    id: snapshot_id,
-                    path: snapshot_path,
-                    created_at: Utc::now().to_rfc3339(),
-                    entrypoint: None,
-                    cmd: None,
-                    env: None,
-                },
-            );
+            register_snapshot(&mut metadata, snapshot_path, None, None, None);
             save_metadata(&metadata).context("Failed to save metadata")?;
         }
         Commands::Start { snapshot } => {
@@ -132,12 +144,13 @@ fn main() -> Result<()> {
                     snapshot_id: "".to_string(),
                     created_at: Utc::now().to_rfc3339(),
                     dir: sandbox_dir.clone(),
+                    pid: None,
                 },
             );
             save_metadata(&metadata)?;
 
             info!("Starting sandbox execution: {}", sandbox_id);
-            if let Err(e) = run_sandbox(merged_dir.to_str().unwrap(), &[]) {
+            if let Err(e) = run_sandbox(&sandbox_id, merged_dir.to_str().unwrap(), &[], None, None, sandbox::SandboxProfile::Runtime) {
                 error!("Sandbox {} failed: {}", sandbox_id, e);
             }
 
@@ -167,6 +180,39 @@ fn main() -> Result<()> {
                 println!("  {} - {:?}", id, sandbox.dir);
             }
         }
+        Commands::Cache { command } => match command {
+            CacheCommands::List => {
+                for artifact in list_build_artifacts()? {
+                    println!(
+                        "{} dockerfile_md5={} context_hash={} path={:?} last_used_at={}",
+                        artifact.cache_key,
+                        artifact.dockerfile_md5,
+                        artifact.context_hash,
+                        artifact.snapshot_path,
+                        artifact.last_used_at
+                    );
+                }
+            }
+            CacheCommands::Prune { dockerfile_md5, cache_key } => {
+                let mode = if let Some(cache_key) = cache_key.clone() {
+                    BuildCachePruneMode::Scope(BuildCacheScope::CacheKey(cache_key))
+                } else if let Some(dockerfile_md5) = dockerfile_md5.clone() {
+                    BuildCachePruneMode::Scope(BuildCacheScope::DockerfileMd5(dockerfile_md5))
+                } else {
+                    BuildCachePruneMode::RemoveMissingOnly
+                };
+
+                let removed = prune_build_artifacts(mode)?;
+                info!("Pruned {} build artifact cache entrie(s)", removed.len());
+                for artifact in removed {
+                    println!("removed {} -> {:?}", artifact.cache_key, artifact.snapshot_path);
+                }
+            }
+            CacheCommands::Clear => {
+                let removed = prune_build_artifacts(BuildCachePruneMode::ClearAll)?;
+                info!("Cleared {} build artifact cache entrie(s)", removed.len());
+            }
+        },
         Commands::Destroy { sandbox_id } => {
             let mut metadata = load_metadata()?;
             if let Some(sandbox) = metadata.sandboxes.remove(sandbox_id) {

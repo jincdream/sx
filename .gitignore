@@ -1,0 +1,55 @@
+# ===== Rust =====
+# Cargo 编译产物
+**/target/
+**/*.rs.bk
+.rustc_info.json
+
+# Cargo.lock（库项目忽略，二进制项目保留）
+# 本项目为二进制项目，保留 Cargo.lock
+# Cargo.lock
+
+# ===== IDE / 编辑器 =====
+# VS Code
+.vscode/
+*.code-workspace
+
+# JetBrains (CLion / IntelliJ IDEA)
+.idea/
+*.iml
+
+# Vim
+*.swp
+*.swo
+*~
+
+# ===== macOS =====
+.DS_Store
+.AppleDouble
+.LSOverride
+.bash_profile
+._*
+
+# ===== Linux =====
+*~
+.directory
+
+# ===== 临时文件 =====
+tmp/
+*.tmp
+*.log
+
+# ===== mini-daytona 运行时产物 =====
+# 本地运行时数据目录（在 ~/.mini-daytona/ 下，通常不会在项目内）
+.mini-daytona/
+
+# 构建过程中可能产生的快照文件
+*.tar.gz
+
+# ===== 环境变量 =====
+.env
+.env.local
+.env.*.local
+
+# ===== Docker =====
+# 不忽略 Dockerfile 本身，但忽略 Docker 构建缓存
+.dockerignore

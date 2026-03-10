@@ -11,17 +11,31 @@ pub enum Instruction {
     Env { key: String, value: String },
     Entrypoint(Vec<String>),
     Cmd(Vec<String>),
+    User(String),
+    Expose(String),
 }
 
 pub fn parse_dockerfile(path: &Path) -> anyhow::Result<Vec<Instruction>> {
     let content = fs::read_to_string(path)?;
     let mut instructions = Vec::new();
+    let mut current_line = String::new();
 
-    for line in content.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
+    for raw_line in content.lines() {
+        let trimmed = raw_line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
+
+        if trimmed.ends_with('\\') {
+            current_line.push_str(&trimmed[..trimmed.len() - 1]);
+            current_line.push(' ');
+            continue;
+        } else {
+            current_line.push_str(trimmed);
+        }
+
+        let line = current_line.trim().to_string();
+        current_line.clear();
 
         let parts: Vec<&str> = line.splitn(2, |c: char| c.is_whitespace()).collect();
         if parts.len() < 2 {
@@ -54,12 +68,23 @@ pub fn parse_dockerfile(path: &Path) -> anyhow::Result<Vec<Instruction>> {
             }
             "WORKDIR" => instructions.push(Instruction::Workdir(arg.to_string())),
             "ENV" => {
-                let parts: Vec<&str> = arg.splitn(2, '=').collect();
-                if parts.len() == 2 {
-                    instructions.push(Instruction::Env {
-                        key: parts[0].trim().to_string(),
-                        value: parts[1].trim().to_string(),
-                    });
+                if arg.contains('=') {
+                    for entry in arg.split_whitespace() {
+                        if let Some((key, value)) = entry.split_once('=') {
+                            instructions.push(Instruction::Env {
+                                key: key.trim().to_string(),
+                                value: value.trim().to_string(),
+                            });
+                        }
+                    }
+                } else {
+                    let parts: Vec<&str> = arg.splitn(2, |c: char| c.is_whitespace()).collect();
+                    if parts.len() == 2 {
+                        instructions.push(Instruction::Env {
+                            key: parts[0].trim().to_string(),
+                            value: parts[1].trim().to_string(),
+                        });
+                    }
                 }
             }
             "ENTRYPOINT" => {
@@ -72,6 +97,8 @@ pub fn parse_dockerfile(path: &Path) -> anyhow::Result<Vec<Instruction>> {
                     instructions.push(Instruction::Cmd(vec));
                 }
             }
+            "USER" => instructions.push(Instruction::User(arg.to_string())),
+            "EXPOSE" => instructions.push(Instruction::Expose(arg.to_string())),
             _ => {}
         }
     }
