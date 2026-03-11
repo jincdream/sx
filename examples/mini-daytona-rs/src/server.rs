@@ -16,7 +16,7 @@ use crate::build::parser::{parse_dockerfile, Instruction};
 use crate::metadata::{load_metadata, register_snapshot, save_metadata, SandboxMetadata};
 use crate::overlay::OverlayMount;
 use crate::sandbox::{run_sandbox, ResourceLimits, SandboxProfile};
-use crate::snapshot::{create_archive, get_sandboxes_dir, hardlink_copy};
+use crate::snapshot::{create_archive, get_sandboxes_dir};
 use uuid::Uuid;
 
 #[derive(Clone)]
@@ -357,18 +357,14 @@ async fn handle_start(
             .map(|snapshot| snapshot.id.clone())
             .unwrap_or_default();
         
-        std::fs::create_dir_all(&sandbox_dir)?;
-        let base_dir = sandbox_dir.join("base");
-        std::fs::create_dir_all(&base_dir)?;
-        
-        hardlink_copy(&snapshot_path, &base_dir)?;
-        
         let upper_dir = sandbox_dir.join("upper");
         let work_dir = sandbox_dir.join("work");
         let merged_dir = sandbox_dir.join("merged");
         
+        std::fs::create_dir_all(&upper_dir)?;
+        
         let overlay = OverlayMount::new(
-            vec![base_dir],
+            vec![snapshot_path],
             upper_dir,
             work_dir,
             merged_dir.clone(),
