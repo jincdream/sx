@@ -24,4 +24,4 @@ Icon
 .vscode/
 *.swp
 *.swo
-test-puppeteer.js
+run_llm_e2e.js
