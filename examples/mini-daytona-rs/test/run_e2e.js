@@ -937,35 +937,38 @@ except Exception as e:
   // Give the server a moment after Ready signal
   await new Promise(r => setTimeout(r, 3000));
 
-  const nextSandboxUrl = await getSandboxUrl(nextSandboxId);
-  const nextFetchUrlStr = `http://${new URL(nextSandboxUrl).hostname}:3000/`;
-  console.log(`\n[6] Fetching from Next.js server at ${nextFetchUrlStr} via secondary sandbox...`);
+  // 6. Fetch from Next.js server via host-level proxy endpoint
+  //    The API server proxies requests to the sandbox's internal IP:port
+  //    Host accesses: http://localhost:3000/api/sandbox/{id}/proxy/3000/
+  const proxyUrl = `/sandbox/${nextSandboxId}/proxy/3000`;
+  console.log(`\n[6] Fetching Next.js via host proxy: ${API_BASE}${proxyUrl} ...`);
 
-  const clientStartRes = await timedRequest('Next.js', 'start_client', 'POST', '/start', {
-    snapshot: nextSnapshotPath
+  const curlRes = await timedRequest('Next.js', 'proxy_fetch', 'GET', proxyUrl);
+  console.log('Host proxy fetch status:', curlRes.status);
+
+  assert(curlRes.status === 200, `Next.js proxy fetch returned status ${curlRes.status}`);
+  // The proxy returns raw HTML, not JSON — curlRes.data may be null if not JSON
+  // Use a raw HTTP request to get the body as text
+  const proxyContent = await new Promise((resolve, reject) => {
+    const url = new URL(`${API_BASE}${proxyUrl}`);
+    const fetchReq = http.get({
+      hostname: url.hostname,
+      port: url.port,
+      path: url.pathname,
+      timeout: 15000,
+    }, (res) => {
+      let body = '';
+      res.on('data', chunk => body += chunk);
+      res.on('end', () => resolve(body));
+    });
+    fetchReq.on('error', reject);
+    fetchReq.on('timeout', () => { fetchReq.destroy(); reject(new Error('Proxy fetch timeout')); });
   });
-  const clientSandboxId = clientStartRes.data.data.sandbox_id;
-  await new Promise(r => setTimeout(r, 2000));
+  console.log('Host proxy response length:', proxyContent.length);
+  console.log('Host proxy preview:', proxyContent.substring(0, 200));
+  assert(proxyContent.includes('Hello Next.js Daytona!'), 'Next.js content mismatch via host proxy');
 
-  const curlRes = await timedRequest('Next.js', 'exec_client', 'POST', `/sandbox/${clientSandboxId}/exec`, {
-    cmd: ['curl', '-s', nextFetchUrlStr]
-  });
-  console.log('Secondary Sandbox curl Response:', curlRes.data);
-
-  // Debug: Print the next.log server output in case we failed
-  console.log('\n[Debug] Printing the background nextjs log output:\n');
-  const tailRes = await timedRequest('Next.js', 'exec', 'POST', `/sandbox/${nextSandboxId}/exec`, {
-    cmd: ['cat', '/tmp/next.log']
-  });
-  console.log(tailRes.data?.data?.stdout || 'Failed to fetch Next.log');
-
-  assert(curlRes.data.success === true, 'Next.js curl failed');
-  const nextContent = curlRes.data.data.stdout || '';
-  console.log('Next.js page content received, length:', nextContent.length);
-  assert(nextContent.includes('Hello Next.js Daytona!'), 'Next.js content mismatch');
-
-  console.log('\n[7] Destroying Next.js Sandboxes...');
-  await timedRequest('Next.js', 'destroy_client', 'DELETE', `/sandbox/${clientSandboxId}`);
+  console.log('\n[7] Destroying Next.js Sandbox...');
   const nextDestroyRes = await timedRequest('Next.js', 'destroy', 'DELETE', `/sandbox/${nextSandboxId}`);
   console.log('Next.js Destroy Response:', nextDestroyRes.data);
   assert(nextDestroyRes.data.success === true, 'Next.js Sandbox destroy failed');

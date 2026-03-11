@@ -11,9 +11,8 @@ use tracing::{info, error};
 use std::sync::Arc;
 use axum::response::sse::{Event, Sse};
 use axum::response::IntoResponse;
-use tokio_stream::StreamExt;
 use std::convert::Infallible;
-use futures_util::stream::{self, Stream};
+use futures_util::stream::Stream;
 use crate::build::build;
 use crate::build::cache::{list_build_artifacts, prune_build_artifacts, BuildCachePruneMode, BuildCacheScope};
 use crate::build::parser::{parse_dockerfile, Instruction};
@@ -172,6 +171,9 @@ pub async fn run_server() -> anyhow::Result<()> {
         .route("/api/sandbox/{id}/download", get(handle_file_download))
         .route("/api/sandbox/{id}/suspend", post(handle_suspend))
         .route("/api/sandbox/{id}/resume", post(handle_resume))
+        .route("/api/sandbox/{id}/proxy/{port}", get(handle_proxy_root))
+        .route("/api/sandbox/{id}/proxy/{port}/{*rest}", get(handle_proxy))
+        .route("/api/sandbox/{id}/url/{port}", get(handle_sandbox_url))
         .with_state(Arc::new(AppState {}))
         .layer(DefaultBodyLimit::max(50 * 1024 * 1024)); // 50 MiB body limit
 
@@ -848,5 +850,103 @@ async fn handle_resume(
     match result {
         Ok(data) => Json(ApiResponse { success: true, data: Some(data), error: None }),
         Err(e) => Json(ApiResponse { success: false, data: None, error: Some(e.to_string()) }),
+    }
+}
+
+async fn handle_sandbox_url(
+    headers: axum::http::HeaderMap,
+    Path((id, port)): Path<(String, u16)>,
+) -> Json<ApiResponse<serde_json::Value>> {
+    let metadata_res = tokio::task::spawn_blocking(|| load_metadata()).await;
+    let metadata = match metadata_res {
+        Ok(Ok(m)) => m,
+        _ => return Json(ApiResponse { success: false, data: None, error: Some("Failed to load metadata".into()) }),
+    };
+    if !metadata.sandboxes.contains_key(&id) {
+        return Json(ApiResponse { success: false, data: None, error: Some(format!("Sandbox {} not found", id)) });
+    }
+    let host = headers.get("host")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("localhost:3000");
+    let url = format!("http://{}/api/sandbox/{}/proxy/{}", host, id, port);
+    Json(ApiResponse {
+        success: true,
+        data: Some(serde_json::json!({ "url": url })),
+        error: None,
+    })
+}
+
+async fn handle_proxy_root(
+    Path((id, port)): Path<(String, u16)>,
+) -> axum::response::Response {
+    proxy_to_sandbox(&id, port, "").await
+}
+
+async fn handle_proxy(
+    Path((id, port, rest)): Path<(String, u16, String)>,
+) -> axum::response::Response {
+    let path = rest.trim_start_matches('/');
+    proxy_to_sandbox(&id, port, path).await
+}
+
+async fn proxy_to_sandbox(id: &str, port: u16, path: &str) -> axum::response::Response {
+    // Load metadata to get the sandbox IP
+    let metadata = match tokio::task::spawn_blocking(|| load_metadata()).await {
+        Ok(Ok(m)) => m,
+        _ => {
+            return axum::response::Response::builder()
+                .status(500)
+                .body(axum::body::Body::from("Failed to load metadata"))
+                .unwrap();
+        }
+    };
+
+    let sandbox = match metadata.sandboxes.get(id) {
+        Some(s) => s.clone(),
+        None => {
+            return axum::response::Response::builder()
+                .status(404)
+                .body(axum::body::Body::from(format!("Sandbox {} not found", id)))
+                .unwrap();
+        }
+    };
+
+    let target_host = match &sandbox.ip {
+        Some(ip) => ip.clone(),
+        None => "127.0.0.1".to_string(),
+    };
+
+    let target_url = if path.is_empty() {
+        format!("http://{}:{}/", target_host, port)
+    } else {
+        format!("http://{}:{}/{}", target_host, port, path)
+    };
+    info!("Proxy: forwarding to {}", target_url);
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .unwrap();
+
+    match client.get(&target_url).send().await {
+        Ok(resp) => {
+            let status = axum::http::StatusCode::from_u16(resp.status().as_u16())
+                .unwrap_or(axum::http::StatusCode::BAD_GATEWAY);
+            let mut builder = axum::response::Response::builder().status(status);
+
+            // Forward content-type header
+            if let Some(ct) = resp.headers().get("content-type") {
+                builder = builder.header("content-type", ct.as_bytes());
+            }
+
+            let body_bytes = resp.bytes().await.unwrap_or_default();
+            builder.body(axum::body::Body::from(body_bytes)).unwrap()
+        }
+        Err(e) => {
+            axum::response::Response::builder()
+                .status(502)
+                .body(axum::body::Body::from(format!("Proxy error: {}", e)))
+                .unwrap()
+        }
     }
 }

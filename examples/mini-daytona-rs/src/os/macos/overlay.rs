@@ -1,6 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use tracing::{info, warn};
+use tracing::info;
 
 pub fn mount_overlay(merged_dir: &Path, lower_dirs: &[PathBuf], upper_dir: &Path, _work_dir: &Path) -> anyhow::Result<()> {
     fs::create_dir_all(upper_dir)?;
