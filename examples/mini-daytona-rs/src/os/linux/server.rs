@@ -56,3 +56,21 @@ pub fn exec_sandbox(sandbox: &SandboxMetadata, cmd: &[String], env_vars: &[Strin
         Ok(output)
     }
 }
+
+pub fn suspend_sandbox_os(sandbox: &SandboxMetadata, _merged_dir: &Path) -> anyhow::Result<()> {
+    if let Some(pid) = sandbox.pid {
+        unsafe {
+            let _ = libc::kill(pid, libc::SIGSTOP);
+        }
+    }
+    Ok(())
+}
+
+pub fn resume_sandbox_os(sandbox: &SandboxMetadata, _merged_dir: &Path) -> anyhow::Result<()> {
+    if let Some(pid) = sandbox.pid {
+        unsafe {
+            let _ = libc::kill(pid, libc::SIGCONT);
+        }
+    }
+    Ok(())
+}

@@ -7,6 +7,14 @@ const path = require('node:path');
 
 const CLIENT_ONLY = process.argv.includes('--client');
 
+const testArg = process.argv.find(a => a.startsWith('--test='));
+const TEST_FILTER = testArg ? testArg.split('=')[1].toLowerCase() : null;
+
+function shouldRunTest(name) {
+  if (!TEST_FILTER) return true;
+  return name.toLowerCase().includes(TEST_FILTER);
+}
+
 // Setup environment (only needed when running the server locally)
 if (!CLIENT_ONLY) {
   const baseHome = process.env.DAYTONA_HOME || '/var/run/daytona_home';
@@ -155,12 +163,12 @@ async function runTests() {
     ? '[macOS Degraded Mode] Skipping image binary execution tests (server cannot run Linux image binaries natively).'
     : '[Capability Check] Skipping image binary execution tests.';
 
-  console.log('--- Starting API Integration Test ---');
-
   const path = require('path');
   const projectRoot = path.join(__dirname, '..');
-
   const getBuildPath = (subPath) => CLIENT_ONLY ? subPath : path.join(projectRoot, subPath);
+
+  if (shouldRunTest('api') || shouldRunTest('nginx')) {
+    console.log('--- Starting API Integration Test ---');
 
   // 1. Build Snapshot
   console.log('\n[1] Requesting Build...');
@@ -214,30 +222,46 @@ async function runTests() {
   assert(readRes.data.success === true, 'File read failed');
   assert(readRes.data.data === 'console.log("Hello Node Integration Test!");', 'File content mismatch');
 
-  // 6. Delete File
-  console.log('\n[6] Deleting file...');
+  // 6. Suspend Sandbox
+  console.log('\n[6] Suspending Sandbox...');
+  const suspendRes = await timedRequest('Nginx', 'suspend', 'POST', `/sandbox/${sandboxId}/suspend`);
+  console.log('Suspend Response:', suspendRes.data);
+  assert(suspendRes.data.success === true, 'Sandbox suspend failed');
+
+  await new Promise(r => setTimeout(r, 1000));
+
+  // 7. Resume Sandbox
+  console.log('\n[7] Resuming Sandbox...');
+  const resumeRes = await timedRequest('Nginx', 'resume', 'POST', `/sandbox/${sandboxId}/resume`);
+  console.log('Resume Response:', resumeRes.data);
+  assert(resumeRes.data.success === true, 'Sandbox resume failed');
+
+  // 8. Delete File
+  console.log('\n[8] Deleting file...');
   const delRes = await timedRequest('Nginx', 'file_delete', 'DELETE', `/sandbox/${sandboxId}/file`, {
     path: '/usr/share/nginx/html/custom.js'
   });
   console.log('Delete Response:', delRes.data);
   assert(delRes.data.success === true, 'File delete failed');
 
-  // 7. Verify DELETED File
-  console.log('\n[7] Verifying file deletion (expect to fail)...');
+  // 9. Verify DELETED File
+  console.log('\n[9] Verifying file deletion (expect to fail)...');
   const deletedReadRes = await timedRequest('Nginx', 'file_read_deleted', 'GET', `/sandbox/${sandboxId}/file?path=/usr/share/nginx/html/custom.js`);
   console.log('Read Deleted File Response:', deletedReadRes.data);
   assert(deletedReadRes.data.success === false, 'File delete verification failed');
 
-  // 8. Destroy Sandbox
-  console.log('\n[8] Destroying Sandbox...');
+  // 10. Destroy Sandbox
+  console.log('\n[10] Destroying Sandbox...');
   const destroyRes = await timedRequest('Nginx', 'destroy', 'DELETE', `/sandbox/${sandboxId}`);
   console.log('Destroy Response:', destroyRes.data);
   assert(destroyRes.data.success === true, 'Sandbox destroy failed');
+  }
 
   // ===============================
   // Test 2: Python Environment Test
   // ===============================
-  console.log('\n--- Starting Python Environment Test ---');
+  if (shouldRunTest('python')) {
+    console.log('\n--- Starting Python Environment Test ---');
 
   // 1. Build Snapshot (Python)
   console.log('\n[Wait for 2s] Requesting Python Build...');
@@ -315,11 +339,13 @@ print(json.dumps(output))
   const pyDestroyRes = await timedRequest('Python', 'destroy', 'DELETE', `/sandbox/${pySandboxId}`);
   console.log('Python Destroy Response:', pyDestroyRes.data);
   assert(pyDestroyRes.data.success === true, 'Python Sandbox destroy failed');
+  }
 
   // ===============================
   // Test 3: Data Analysis Environment Test
   // ===============================
-  console.log('\n--- Starting Data Analysis Environment Test ---');
+  if (shouldRunTest('data') || shouldRunTest('analysis')) {
+    console.log('\n--- Starting Data Analysis Environment Test ---');
 
   // 1. Build Snapshot (Data Analysis)
   console.log('\n[Wait for 2s] Requesting Data Analysis Build...');
@@ -388,23 +414,25 @@ print(json.dumps(result))
   const daDestroyRes = await timedRequest('DataAnalysis', 'destroy', 'DELETE', `/sandbox/${daSandboxId}`);
   console.log('Data Analysis Destroy Response:', daDestroyRes.data);
   assert(daDestroyRes.data.success === true, 'Data Analysis Sandbox destroy failed');
+  }
 
   // ===============================
   // Test 4: File Upload (xlsx) + Python Processing Test
   // ===============================
-  console.log('\n--- Starting File Upload & Excel Processing Test ---');
+  let ulSnapshotPath;
+  if (shouldRunTest('upload') || shouldRunTest('excel') || shouldRunTest('resource') || shouldRunTest('limit')) {
+    console.log('\n[Wait for 2s] Requesting Data Analysis Build for Upload/Resource Test...');
+    await new Promise(r => setTimeout(r, 2000));
+    const ulBuildRes = await timedRequest('Upload', 'build', 'POST', '/build', {
+      dockerfile: getBuildPath('images/data-analysis/Dockerfile'),
+      context: getBuildPath('images/data-analysis')
+    });
+    assert(ulBuildRes.data.success === true, 'Upload Test Build failed');
+    ulSnapshotPath = ulBuildRes.data.data.snapshot_path;
+  }
 
-  // 1. Build Snapshot (reuse data-analysis image which has pandas + openpyxl)
-  console.log('\n[Wait for 2s] Requesting Data Analysis Build for Upload Test...');
-  await new Promise(r => setTimeout(r, 2000));
-  const ulBuildRes = await timedRequest('Upload', 'build', 'POST', '/build', {
-    dockerfile: getBuildPath('images/data-analysis/Dockerfile'),
-    context: getBuildPath('images/data-analysis')
-  });
-  console.log('Upload Test Build Response:', ulBuildRes.data);
-  assert(ulBuildRes.data.success === true, 'Upload Test Build failed');
-
-  const ulSnapshotPath = ulBuildRes.data.data.snapshot_path;
+  if (shouldRunTest('upload') || shouldRunTest('excel')) {
+    console.log('\n--- Starting File Upload & Excel Processing Test ---');
 
   // 2. Start Sandbox with custom resource limits
   console.log('\n[2] Starting sandbox with custom resource limits...');
@@ -513,11 +541,13 @@ except Exception as e:
   const ulDestroyRes = await timedRequest('Upload', 'destroy', 'DELETE', `/sandbox/${ulSandboxId}`);
   console.log('Upload Test Destroy Response:', ulDestroyRes.data);
   assert(ulDestroyRes.data.success === true, 'Upload Test Sandbox destroy failed');
+  }
 
   // ===============================
   // Test 5: Resource Limits Test
   // ===============================
-  console.log('\n--- Starting Resource Limits Test ---');
+  if (shouldRunTest('resource') || shouldRunTest('limit')) {
+    console.log('\n--- Starting Resource Limits Test ---');
 
   // 1. Start sandbox with restricted resources
   console.log('\n[1] Starting sandbox with strict resource limits...');
@@ -552,18 +582,17 @@ except Exception as e:
   console.log('\n[3] Destroying Resource Limits Sandbox...');
   const rlDestroyRes = await timedRequest('ResourceLimits', 'destroy', 'DELETE', `/sandbox/${rlSandboxId}`);
   assert(rlDestroyRes.data.success === true, 'Resource Limits Sandbox destroy failed');
+  }
 
   // ===============================
   // Test 6: Puppeteer Environment Test
   // ===============================
-  console.log('\n--- Starting Puppeteer Environment Test ---');
+  if (shouldRunTest('puppeteer')) {
+    console.log('\n--- Starting Puppeteer Environment Test ---');
 
   if (!canRunImageExec) {
     console.log('[Capability Check] Skipping Puppeteer suite (server cannot run image binaries).');
-    console.log('\n✅ All API tests passed successfully!');
-    printPerfReport();
-    return;
-  }
+  } else {
 
   // 1. Build Snapshot (Puppeteer)
   console.log('\n[Wait for 2s] Requesting Puppeteer Build...');
@@ -620,6 +649,8 @@ except Exception as e:
   const pbDestroyRes = await timedRequest('Puppeteer', 'destroy', 'DELETE', `/sandbox/${pbSandboxId}`);
   console.log('Puppeteer Destroy Response:', pbDestroyRes.data);
   assert(pbDestroyRes.data.success === true, 'Puppeteer Sandbox destroy failed');
+  }
+  }
 
   console.log('\n✅ All API tests passed successfully!');
 
@@ -650,7 +681,7 @@ async function main() {
   spawnSync('cargo', ['test'], { stdio: 'inherit', cwd: projectRoot });
 
   console.log("--- Starting Server ---");
-  const server = spawn('./target/release/mini-daytona-rs', ['server'], { stdio: 'ignore', cwd: projectRoot });
+  const server = spawn('./target/release/mini-daytona-rs', ['server'], { stdio: 'inherit', cwd: projectRoot });
 
   // Wait for server to boot
   await new Promise(r => setTimeout(r, 3000));

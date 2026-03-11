@@ -148,6 +148,8 @@ pub async fn run_server() -> anyhow::Result<()> {
         .route("/api/sandbox/{id}/file", delete(handle_file_delete))
         .route("/api/sandbox/{id}/upload", post(handle_file_upload))
         .route("/api/sandbox/{id}/download", get(handle_file_download))
+        .route("/api/sandbox/{id}/suspend", post(handle_suspend))
+        .route("/api/sandbox/{id}/resume", post(handle_resume))
         .with_state(Arc::new(AppState {}))
         .layer(DefaultBodyLimit::max(50 * 1024 * 1024)); // 50 MiB body limit
 
@@ -655,6 +657,46 @@ async fn handle_file_download(
             let bytes = std::fs::read(&target)?;
             let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
             Ok(encoded)
+        } else {
+            anyhow::bail!("Sandbox {} not found", id);
+        }
+    }).await.unwrap_or_else(|e| Err(anyhow::anyhow!("Task panic: {}", e)));
+
+    match result {
+        Ok(data) => Json(ApiResponse { success: true, data: Some(data), error: None }),
+        Err(e) => Json(ApiResponse { success: false, data: None, error: Some(e.to_string()) }),
+    }
+}
+
+async fn handle_suspend(
+    Path(id): Path<String>,
+) -> Json<ApiResponse<String>> {
+    let result = tokio::task::spawn_blocking(move || {
+        let metadata = load_metadata()?;
+        if let Some(sandbox) = metadata.sandboxes.get(&id) {
+            let merged_dir = sandbox.dir.join("merged");
+            crate::os::sys::suspend_sandbox_os(sandbox, &merged_dir)?;
+            Ok(format!("Suspended sandbox {}", id))
+        } else {
+            anyhow::bail!("Sandbox {} not found", id);
+        }
+    }).await.unwrap_or_else(|e| Err(anyhow::anyhow!("Task panic: {}", e)));
+
+    match result {
+        Ok(data) => Json(ApiResponse { success: true, data: Some(data), error: None }),
+        Err(e) => Json(ApiResponse { success: false, data: None, error: Some(e.to_string()) }),
+    }
+}
+
+async fn handle_resume(
+    Path(id): Path<String>,
+) -> Json<ApiResponse<String>> {
+    let result = tokio::task::spawn_blocking(move || {
+        let metadata = load_metadata()?;
+        if let Some(sandbox) = metadata.sandboxes.get(&id) {
+            let merged_dir = sandbox.dir.join("merged");
+            crate::os::sys::resume_sandbox_os(sandbox, &merged_dir)?;
+            Ok(format!("Resumed sandbox {}", id))
         } else {
             anyhow::bail!("Sandbox {} not found", id);
         }
