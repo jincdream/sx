@@ -17,10 +17,25 @@ function shouldRunTest(name) {
 
 // Setup environment (only needed when running the server locally)
 if (!CLIENT_ONLY) {
-  const baseHome = process.env.DAYTONA_HOME || '/var/run/daytona_home';
+  let baseHome = process.env.DAYTONA_HOME || '/var/run/daytona_home';
   process.env.HOME = baseHome;
   process.env.TMPDIR = path.join(baseHome, 'tmp');
-  fs.mkdirSync(process.env.TMPDIR, { recursive: true });
+  try {
+    fs.mkdirSync(process.env.TMPDIR, { recursive: true });
+  } catch (err) {
+    if (err.code === 'EACCES' && !process.env.DAYTONA_HOME) {
+      console.warn(`\n[WARN] Permission denied creating ${process.env.TMPDIR}`);
+      console.warn(`[WARN] Falling back to /tmp/daytona_home for local E2E test`);
+      console.warn(`[WARN] (If testing a Docker server, remember to pass '--client')\n`);
+      baseHome = '/tmp/daytona_home';
+      process.env.HOME = baseHome;
+      process.env.DAYTONA_HOME = baseHome;
+      process.env.TMPDIR = path.join(baseHome, 'tmp');
+      fs.mkdirSync(process.env.TMPDIR, { recursive: true });
+    } else {
+      throw err;
+    }
+  }
 }
 
 const API_BASE = 'http://localhost:3000/api';
@@ -90,6 +105,116 @@ async function timedRequest(test, operation, method, route, body) {
   const elapsed = performance.now() - t0;
   perfTracker.add(test, operation, elapsed);
   return result;
+}
+
+/**
+ * Stream exec via SSE. Sends { cmd, stream: true } and consumes SSE events.
+ * @param {string} sandboxId
+ * @param {string[]} cmd
+ * @param {object} options - { waitForText, timeoutMs, onStdout, onStderr }
+ * @returns {Promise<{ stdout: string, stderr: string, exitCode: number|null }>}
+ */
+async function streamExec(sandboxId, cmd, options = {}) {
+  const { waitForText, timeoutMs = 60000, onStdout, onStderr } = options;
+  return new Promise((resolve, reject) => {
+    const url = new URL(`${API_BASE}/sandbox/${sandboxId}/exec`);
+    const bodyStr = JSON.stringify({ cmd, stream: true });
+    const reqOptions = {
+      hostname: url.hostname,
+      port: url.port,
+      path: url.pathname,
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(bodyStr),
+        'Accept': 'text/event-stream',
+      },
+      timeout: timeoutMs,
+    };
+
+    let stdout = '';
+    let stderr = '';
+    let exitCode = null;
+    let resolved = false;
+
+    const timer = setTimeout(() => {
+      if (!resolved) {
+        resolved = true;
+        req.destroy();
+        resolve({ stdout, stderr, exitCode });
+      }
+    }, timeoutMs);
+
+    const req = http.request(reqOptions, (res) => {
+      let buffer = '';
+      res.on('data', (chunk) => {
+        buffer += chunk.toString();
+        // Parse SSE events from the buffer
+        const parts = buffer.split('\n\n');
+        buffer = parts.pop(); // keep incomplete last part
+        for (const part of parts) {
+          let eventType = 'message';
+          let data = '';
+          for (const line of part.split('\n')) {
+            if (line.startsWith('event:')) eventType = line.slice(6).trim();
+            else if (line.startsWith('data:')) data += line.slice(5);
+          }
+          if (eventType === 'stdout') {
+            stdout += data;
+            if (onStdout) onStdout(data);
+            if (waitForText && stdout.includes(waitForText) && !resolved) {
+              resolved = true;
+              clearTimeout(timer);
+              req.destroy();
+              resolve({ stdout, stderr, exitCode });
+            }
+          } else if (eventType === 'stderr') {
+            stderr += data;
+            if (onStderr) onStderr(data);
+            if (waitForText && stderr.includes(waitForText) && !resolved) {
+              resolved = true;
+              clearTimeout(timer);
+              req.destroy();
+              resolve({ stdout, stderr, exitCode });
+            }
+          } else if (eventType === 'exit') {
+            exitCode = parseInt(data, 10);
+            if (!resolved) {
+              resolved = true;
+              clearTimeout(timer);
+              resolve({ stdout, stderr, exitCode });
+            }
+          }
+        }
+      });
+      res.on('end', () => {
+        if (!resolved) {
+          resolved = true;
+          clearTimeout(timer);
+          resolve({ stdout, stderr, exitCode });
+        }
+      });
+    });
+
+    req.on('error', (err) => {
+      if (!resolved) {
+        resolved = true;
+        clearTimeout(timer);
+        reject(err);
+      }
+    });
+    req.on('timeout', () => {
+      if (!resolved) {
+        resolved = true;
+        clearTimeout(timer);
+        req.destroy();
+        resolve({ stdout, stderr, exitCode });
+      }
+    });
+
+    req.write(bodyStr);
+    req.end();
+  });
 }
 
 async function getSandboxUrl(sandboxId) {
@@ -178,7 +303,7 @@ async function runTests() {
 
   const path = require('path');
   const projectRoot = path.join(__dirname, '..');
-  const getBuildPath = (subPath) => CLIENT_ONLY ? subPath : path.join(projectRoot, subPath);
+  const getBuildPath = (subPath) => CLIENT_ONLY ? `/var/run/daytona_home/${subPath}` : path.join(projectRoot, subPath);
 
   if (shouldRunTest('api') || shouldRunTest('nginx')) {
     console.log('--- Starting API Integration Test ---');
@@ -735,6 +860,115 @@ except Exception as e:
   const pbDestroyRes = await timedRequest('Puppeteer', 'destroy', 'DELETE', `/sandbox/${pbSandboxId}`);
   console.log('Puppeteer Destroy Response:', pbDestroyRes.data);
   assert(pbDestroyRes.data.success === true, 'Puppeteer Sandbox destroy failed');
+  }
+  }
+
+  // ===============================
+  // Test 7: Next.js Environment Test
+  // ===============================
+  if (shouldRunTest('nextjs') || shouldRunTest('next')) {
+    console.log('\n--- Starting Next.js Environment Test ---');
+
+  if (!canRunImageExec) {
+    console.log('[Capability Check] Skipping Next.js test (server cannot run image binaries).');
+  } else {
+  // 1. Build Snapshot (Next.js)
+  console.log('\n[Wait for 2s] Requesting Next.js Build...');
+  await new Promise(r => setTimeout(r, 2000));
+  const nextBuildRes = await timedRequest('Next.js', 'build', 'POST', '/build', {
+    dockerfile: getBuildPath('images/nextjs/Dockerfile'),
+    context: getBuildPath('images/nextjs')
+  });
+  console.log('Next.js Build Response:', nextBuildRes.data);
+  assert(nextBuildRes.data.success === true, 'Next.js Build failed');
+
+  const nextSnapshotPath = nextBuildRes.data.data.snapshot_path;
+  assert(nextSnapshotPath, 'Next.js Snapshot path is missing');
+
+  // 2. Start Sandbox (Next.js)
+  console.log('\n[2] Requesting Next.js Sandbox Start...');
+  const nextStartRes = await timedRequest('Next.js', 'start', 'POST', '/start', {
+    snapshot: nextSnapshotPath
+  });
+  console.log('Next.js Start Response:', nextStartRes.data);
+  const nextSandboxId = nextStartRes.data.data.sandbox_id;
+  assert(nextSandboxId, 'Next.js Sandbox ID is missing');
+
+  await new Promise(r => setTimeout(r, 3000));
+
+  // 3. Create Next.js App
+  console.log('\\n[3] Creating Next.js App (this may take a minute)...');
+  const nextCreateRes = await timedRequest('Next.js', 'exec', 'POST', `/sandbox/${nextSandboxId}/exec`, {
+    cmd: ['create-next-app', '/home/daytona/workspace/my-app', '--yes', '--javascript', '--no-tailwind', '--no-eslint', '--app', '--no-src-dir', '--import-alias', '@/*', '--use-npm']
+  });
+  console.log('Next.js Create Response:', nextCreateRes.data);
+  assert(nextCreateRes.data.success === true, 'Next.js app creation failed');
+
+  // Override config to bind to 0.0.0.0
+  console.log('\\n[4] Modifying package.json to bind to 0.0.0.0...');
+  const sedRes = await timedRequest('Next.js', 'exec', 'POST', `/sandbox/${nextSandboxId}/exec`, {
+    cmd: ['sed', '-i', 's/"dev": "next dev"/"dev": "next dev -H 0.0.0.0"/', '/home/daytona/workspace/my-app/package.json']
+  });
+  console.log('sed Response:', sedRes.data);
+
+  // Add custom test content
+  const pageContent = `export default function Home() { return <div>Hello Next.js Daytona!</div>; }`;
+  await timedRequest('Next.js', 'file_write', 'POST', `/sandbox/${nextSandboxId}/file`, {
+    path: '/home/daytona/workspace/my-app/app/page.js',
+    content: pageContent
+  });
+
+  // 5. Start Next.js dev server via SSE streaming
+  console.log('\n[5] Starting Next.js dev server (SSE streaming)...');
+  const t0dev = performance.now();
+  const devResult = await streamExec(nextSandboxId,
+    ['sh', '-c', 'cd /home/daytona/workspace/my-app && npm run dev'],
+    {
+      waitForText: 'Ready',
+      timeoutMs: 120000,
+      onStdout: (chunk) => process.stdout.write(`[next:stdout] ${chunk}\n`),
+      onStderr: (chunk) => process.stderr.write(`[next:stderr] ${chunk}\n`),
+    }
+  );
+  perfTracker.add('Next.js', 'dev_server_start', performance.now() - t0dev);
+  console.log(`\nNext.js dev server streaming finished. exitCode=${devResult.exitCode}`);
+  console.log('stdout length:', devResult.stdout.length, 'stderr length:', devResult.stderr.length);
+
+  // Give the server a moment after Ready signal
+  await new Promise(r => setTimeout(r, 3000));
+
+  const nextSandboxUrl = await getSandboxUrl(nextSandboxId);
+  const nextFetchUrlStr = `http://${new URL(nextSandboxUrl).hostname}:3000/`;
+  console.log(`\n[6] Fetching from Next.js server at ${nextFetchUrlStr} via secondary sandbox...`);
+
+  const clientStartRes = await timedRequest('Next.js', 'start_client', 'POST', '/start', {
+    snapshot: nextSnapshotPath
+  });
+  const clientSandboxId = clientStartRes.data.data.sandbox_id;
+  await new Promise(r => setTimeout(r, 2000));
+
+  const curlRes = await timedRequest('Next.js', 'exec_client', 'POST', `/sandbox/${clientSandboxId}/exec`, {
+    cmd: ['curl', '-s', nextFetchUrlStr]
+  });
+  console.log('Secondary Sandbox curl Response:', curlRes.data);
+
+  // Debug: Print the next.log server output in case we failed
+  console.log('\n[Debug] Printing the background nextjs log output:\n');
+  const tailRes = await timedRequest('Next.js', 'exec', 'POST', `/sandbox/${nextSandboxId}/exec`, {
+    cmd: ['cat', '/tmp/next.log']
+  });
+  console.log(tailRes.data?.data?.stdout || 'Failed to fetch Next.log');
+
+  assert(curlRes.data.success === true, 'Next.js curl failed');
+  const nextContent = curlRes.data.data.stdout || '';
+  console.log('Next.js page content received, length:', nextContent.length);
+  assert(nextContent.includes('Hello Next.js Daytona!'), 'Next.js content mismatch');
+
+  console.log('\n[7] Destroying Next.js Sandboxes...');
+  await timedRequest('Next.js', 'destroy_client', 'DELETE', `/sandbox/${clientSandboxId}`);
+  const nextDestroyRes = await timedRequest('Next.js', 'destroy', 'DELETE', `/sandbox/${nextSandboxId}`);
+  console.log('Next.js Destroy Response:', nextDestroyRes.data);
+  assert(nextDestroyRes.data.success === true, 'Next.js Sandbox destroy failed');
   }
   }
 

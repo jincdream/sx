@@ -9,7 +9,11 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use tracing::{info, error};
 use std::sync::Arc;
-
+use axum::response::sse::{Event, Sse};
+use axum::response::IntoResponse;
+use tokio_stream::StreamExt;
+use std::convert::Infallible;
+use futures_util::stream::{self, Stream};
 use crate::build::build;
 use crate::build::cache::{list_build_artifacts, prune_build_artifacts, BuildCachePruneMode, BuildCacheScope};
 use crate::build::parser::{parse_dockerfile, Instruction};
@@ -63,6 +67,23 @@ pub struct SnapshotRequest {
 #[derive(Deserialize)]
 pub struct ExecRequest {
     cmd: Vec<String>,
+    #[serde(default)]
+    stream: bool,
+}
+
+// Internal type enum for axum response combining either JSON or SSE stream
+pub enum ExecApiResult {
+    Json(Json<ApiResponse<ExecResponse>>),
+    Sse(Sse<std::pin::Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>>),
+}
+
+impl IntoResponse for ExecApiResult {
+    fn into_response(self) -> axum::response::Response {
+        match self {
+            ExecApiResult::Json(json) => json.into_response(),
+            ExecApiResult::Sse(sse) => sse.into_response(),
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -507,35 +528,128 @@ async fn handle_sandbox_info(
 async fn handle_exec(
     Path(id): Path<String>,
     Json(payload): Json<ExecRequest>,
-) -> Json<ApiResponse<ExecResponse>> {
-    let result = tokio::task::spawn_blocking(move || {
-        let metadata = load_metadata()?;
-        if let Some(sandbox) = metadata.sandboxes.get(&id) {
-            if payload.cmd.is_empty() {
-                anyhow::bail!("Command cannot be empty");
+) -> ExecApiResult {
+    if payload.cmd.is_empty() {
+        return ExecApiResult::Json(Json(ApiResponse {
+            success: false,
+            data: None,
+            error: Some("Command cannot be empty".to_string()),
+        }));
+    }
+
+    let metadata_res = tokio::task::spawn_blocking(|| load_metadata()).await.unwrap_or_else(|_| Err(anyhow::anyhow!("tokio spawn blocking failed")));
+    let metadata = match metadata_res {
+        Ok(m) => m,
+        Err(e) => return ExecApiResult::Json(Json(ApiResponse {
+            success: false,
+            data: None,
+            error: Some(e.to_string()),
+        })),
+    };
+
+    let sandbox = match metadata.sandboxes.get(&id) {
+        Some(s) => s.clone(),
+        None => return ExecApiResult::Json(Json(ApiResponse {
+            success: false,
+            data: None,
+            error: Some(format!("Sandbox {} not found", id)),
+        })),
+    };
+
+    let snapshot_env = metadata
+        .snapshots
+        .get(&sandbox.snapshot_id)
+        .and_then(|snapshot| snapshot.env.clone())
+        .unwrap_or_default();
+
+    if payload.stream {
+        // SSE Streaming execution
+        match crate::os::sys::exec_sandbox_stream(&sandbox, &payload.cmd, &snapshot_env).await {
+            Ok(mut child) => {
+                let stdout = child.stdout.take().expect("stdout should be piped");
+                let stderr = child.stderr.take().expect("stderr should be piped");
+
+                use tokio::io::{AsyncReadExt, BufReader};
+                
+                let (tx, rx) = tokio::sync::mpsc::channel(100);
+                
+                let tx_out = tx.clone();
+                tokio::spawn(async move {
+                    let mut reader = BufReader::new(stdout);
+                    let mut buf = [0; 4096];
+                    loop {
+                        match reader.read(&mut buf).await {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                let content = String::from_utf8_lossy(&buf[..n]).to_string();
+                                if tx_out.send(Ok(Event::default().event("stdout").data(content))).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                });
+
+                let tx_err = tx.clone();
+                tokio::spawn(async move {
+                    let mut reader = BufReader::new(stderr);
+                    let mut buf = [0; 4096];
+                    loop {
+                        match reader.read(&mut buf).await {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                let content = String::from_utf8_lossy(&buf[..n]).to_string();
+                                if tx_err.send(Ok(Event::default().event("stderr").data(content))).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                });
+
+                let tx_exit = tx.clone();
+                tokio::spawn(async move {
+                    match child.wait().await {
+                        Ok(status) => {
+                            let code = status.code().unwrap_or(-1i32);
+                            let _ = tx_exit.send(Ok(Event::default().event("exit").data(code.to_string()))).await;
+                        }
+                        Err(_) => {
+                            let _ = tx_exit.send(Ok(Event::default().event("exit").data("-1"))).await;
+                        }
+                    }
+                });
+
+                let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+                ExecApiResult::Sse(Sse::new(Box::pin(stream) as std::pin::Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>))
             }
-
-            let snapshot_env = metadata
-                .snapshots
-                .get(&sandbox.snapshot_id)
-                .and_then(|snapshot| snapshot.env.clone())
-                .unwrap_or_default();
-
-            let output = crate::os::sys::exec_sandbox(sandbox, &payload.cmd, &snapshot_env)?;
+            Err(e) => {
+                let err_msg = e.to_string();
+                ExecApiResult::Json(Json(ApiResponse::<ExecResponse> {
+                    success: false,
+                    data: None,
+                    error: Some(err_msg),
+                }))
+            }
+        }
+    } else {
+        // Synchronous / JSON blocking execution
+        let result = tokio::task::spawn_blocking(move || {
+            let output = crate::os::sys::exec_sandbox(&sandbox, &payload.cmd, &snapshot_env)?;
             
             Ok(ExecResponse {
                 stdout: String::from_utf8_lossy(&output.stdout).to_string(),
                 stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-                exit_code: output.status.code().unwrap_or(-1),
+                exit_code: output.status.code().unwrap_or(-1i32),
             })
-        } else {
-            anyhow::bail!("Sandbox {} not found", id);
-        }
-    }).await.unwrap_or_else(|e| Err(anyhow::anyhow!("Task panic: {}", e)));
+        }).await.unwrap_or_else(|e| Err(anyhow::anyhow!("Task panic: {}", e)));
 
-    match result {
-        Ok(data) => Json(ApiResponse { success: true, data: Some(data), error: None }),
-        Err(e) => Json(ApiResponse { success: false, data: None, error: Some(e.to_string()) }),
+        match result {
+            Ok(data) => ExecApiResult::Json(Json(ApiResponse { success: true, data: Some(data), error: None })),
+            Err(e) => ExecApiResult::Json(Json(ApiResponse::<ExecResponse> { success: false, data: None, error: Some(e.to_string()) })),
+        }
     }
 }
 

@@ -48,12 +48,55 @@ pub fn exec_sandbox(sandbox: &SandboxMetadata, cmd: &[String], env_vars: &[Strin
         let output = command.args(cmd).output()?;
         Ok(output)
     } else {
-        // Fallback (e.g. metadata before the fix)
         let output = Command::new("chroot")
             .arg(&merged_dir)
             .args(cmd)
             .output()?;
         Ok(output)
+    }
+}
+
+pub async fn exec_sandbox_stream(
+    sandbox: &SandboxMetadata,
+    cmd: &[String],
+    env_vars: &[String],
+) -> anyhow::Result<tokio::process::Child> {
+    let merged_dir = sandbox.dir.join("merged");
+
+    if let Some(pid) = sandbox.pid {
+        let mut command = tokio::process::Command::new("nsenter");
+        command
+            .arg("-a") // enter all namespaces (mount, uts, ipc, net, pid, user, cgroup)
+            .arg("-t")
+            .arg(pid.to_string())
+            .env_clear()
+            .env(
+                "PATH",
+                "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            )
+            .env("HOME", "/root")
+            .env("TMPDIR", "/tmp")
+            .env("TERM", "xterm")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+
+        for entry in env_vars {
+            if let Some((key, value)) = entry.split_once('=') {
+                command.env(key, value);
+            }
+        }
+
+        command.args(cmd);
+        Ok(command.spawn()?)
+    } else {
+        // Fallback (e.g. metadata before the fix)
+        let mut command = tokio::process::Command::new("chroot");
+        command
+            .arg(&merged_dir)
+            .args(cmd)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        Ok(command.spawn()?)
     }
 }
 

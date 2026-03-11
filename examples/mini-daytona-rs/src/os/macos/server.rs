@@ -123,6 +123,125 @@ if _M:
     Ok(command.output()?)
 }
 
+pub async fn exec_sandbox_stream(
+    sandbox: &SandboxMetadata,
+    cmd: &[String],
+    env_vars: &[String],
+) -> anyhow::Result<tokio::process::Child> {
+    let merged_dir = sandbox.dir.join("merged");
+
+    // On macOS there are no namespaces. Run supported host tools
+    // while rewriting absolute sandbox paths into merged_dir paths.
+    let effective_cmd = resolve_macos_command(&merged_dir, &cmd[0]);
+    let translated_args: Vec<String> = cmd[1..]
+        .iter()
+        .map(|arg| translate_macos_path_arg(&merged_dir, arg))
+        .collect();
+
+    let merged_dir_str = merged_dir.to_string_lossy().to_string();
+
+    let python_path = std::fs::read_dir(format!("{}/usr/local/lib", merged_dir_str))
+        .ok()
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok())
+                .filter(|e| {
+                    let name = e.file_name();
+                    let n = name.to_string_lossy();
+                    n.starts_with("python") && e.path().join("site-packages").is_dir()
+                })
+                .map(|e| format!("{}/site-packages", e.path().to_string_lossy()))
+                .collect::<Vec<_>>()
+                .join(":")
+        })
+        .unwrap_or_default();
+
+    let is_python = effective_cmd.contains("python");
+    let redirect_dir = if is_python {
+        let dir = format!("{}/tmp/_sandbox_pathfix", merged_dir_str);
+        let _ = std::fs::create_dir_all(&dir);
+        let sc = format!(
+            r#"import os as _os, builtins as _bi
+_M = _os.environ.get('_SANDBOX_MERGED_DIR', '')
+if _M:
+    _orig = _bi.open
+    def _ropen(f, *a, **k):
+        if isinstance(f, str) and f.startswith('/') and not f.startswith(_M):
+            alt = _os.path.join(_M, f.lstrip('/'))
+            if _os.path.exists(alt):
+                f = alt
+        return _orig(f, *a, **k)
+    _bi.open = _ropen
+    import io as _io
+    _iorig = _io.open
+    def _rioopen(f, *a, **k):
+        if isinstance(f, str) and f.startswith('/') and not f.startswith(_M):
+            alt = _os.path.join(_M, f.lstrip('/'))
+            if _os.path.exists(alt):
+                f = alt
+        return _iorig(f, *a, **k)
+    _io.open = _rioopen
+"#
+        );
+        let _ = std::fs::write(format!("{}/sitecustomize.py", dir), sc);
+        Some(dir)
+    } else {
+        None
+    };
+
+    let mut command = tokio::process::Command::new(&effective_cmd);
+    let host_path = std::env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin".to_string());
+    command
+        .args(&translated_args)
+        .current_dir(&merged_dir)
+        .env(
+            "PATH",
+            format!(
+                "{}:{}/usr/local/sbin:{}/usr/local/bin:{}/usr/sbin:{}/usr/bin:{}/sbin:{}/bin",
+                host_path, merged_dir_str, merged_dir_str, merged_dir_str, merged_dir_str, merged_dir_str, merged_dir_str
+            ),
+        )
+        .env("HOME", format!("{}/root", merged_dir_str))
+        .env("TMPDIR", format!("{}/tmp", merged_dir_str))
+        .env(
+            "NODE_PATH",
+            format!(
+                "{0}/usr/local/lib/node_modules:{0}/home/daytona/workspace/node_modules",
+                merged_dir_str
+            ),
+        )
+        .env(
+            "PUPPETEER_CACHE_DIR",
+            format!("{}/.cache/puppeteer", std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string())),
+        )
+        .env("TERM", "xterm")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    for entry in env_vars {
+        if let Some((key, value)) = entry.split_once('=') {
+            command.env(key, value);
+        }
+    }
+
+    if is_python {
+        command.env("_SANDBOX_MERGED_DIR", &merged_dir_str);
+    }
+
+    if !python_path.is_empty() {
+        let final_python_path = if let Some(ref rd) = redirect_dir {
+            format!("{}:{}", rd, python_path)
+        } else {
+            python_path
+        };
+        command.env("PYTHONPATH", &final_python_path);
+    } else if let Some(ref rd) = redirect_dir {
+        command.env("PYTHONPATH", rd);
+    }
+
+    Ok(command.spawn()?)
+}
+
 fn translate_macos_path_arg(merged_dir: &Path, value: &str) -> String {
     if !value.starts_with('/') {
         return value.to_string();

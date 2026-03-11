@@ -78,6 +78,7 @@ docker run -d \
     -e HOME=/var/run/daytona_home \
     -e TMPDIR=/var/run/daytona_home/tmp \
     -v "${VOLUME_NAME}:/var/run/daytona_home" \
+    -v "${SCRIPT_DIR}/images:/var/run/daytona_home/images" \
     "$IMAGE_NAME" \
     sh -c 'mkdir -p /var/run/daytona_home/tmp && ./target/release/mini-daytona-rs server' \
     >/dev/null
