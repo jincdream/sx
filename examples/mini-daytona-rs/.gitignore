@@ -24,3 +24,4 @@ Icon
 .vscode/
 *.swp
 *.swo
+test-puppeteer.js
