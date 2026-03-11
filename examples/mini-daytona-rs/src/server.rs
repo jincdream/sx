@@ -142,6 +142,7 @@ pub async fn run_server() -> anyhow::Result<()> {
         .route("/api/snapshot", post(handle_snapshot))
         .route("/api/list", get(handle_list))
         .route("/api/sandbox/{id}", delete(handle_destroy))
+        .route("/api/sandbox/{id}/info", get(handle_sandbox_info))
         .route("/api/sandbox/{id}/exec", post(handle_exec))
         .route("/api/sandbox/{id}/file", get(handle_file_read))
         .route("/api/sandbox/{id}/file", post(handle_file_write))
@@ -382,6 +383,7 @@ async fn handle_start(
                 created_at: Utc::now().to_rfc3339(),
                 dir: sandbox_dir.clone(),
                 pid: None,
+                ip: None,
             },
         );
         save_metadata(&metadata)?;
@@ -464,6 +466,33 @@ async fn handle_destroy(
             std::fs::remove_dir_all(&sandbox.dir)?;
             save_metadata(&metadata)?;
             Ok(format!("Destroyed sandbox {}", id))
+        } else {
+            anyhow::bail!("Sandbox {} not found", id);
+        }
+    }).await.unwrap_or_else(|e| Err(anyhow::anyhow!("Task panic: {}", e)));
+
+    match result {
+        Ok(data) => Json(ApiResponse { success: true, data: Some(data), error: None }),
+        Err(e) => Json(ApiResponse { success: false, data: None, error: Some(e.to_string()) }),
+    }
+}
+
+#[derive(Serialize)]
+pub struct SandboxInfoResponse {
+    pub id: String,
+    pub ip: Option<String>,
+}
+
+async fn handle_sandbox_info(
+    Path(id): Path<String>,
+) -> Json<ApiResponse<SandboxInfoResponse>> {
+    let result = tokio::task::spawn_blocking(move || {
+        let metadata = load_metadata()?;
+        if let Some(sandbox) = metadata.sandboxes.get(&id) {
+            Ok(SandboxInfoResponse {
+                id: sandbox.id.clone(),
+                ip: sandbox.ip.clone(),
+            })
         } else {
             anyhow::bail!("Sandbox {} not found", id);
         }

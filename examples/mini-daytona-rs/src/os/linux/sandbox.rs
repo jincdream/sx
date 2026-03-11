@@ -87,6 +87,13 @@ pub fn run_sandbox(sandbox_id: &str, merged_dir: &str, cmd: &[&str], limits: Opt
     if let Err(e) = netns::setup_sandbox_net(pid_val, net_index, Some(merged_dir)) {
         warn!("Failed to setup sandbox network: {}", e);
         // Child will still run but without network
+    } else {
+        if let Ok(mut metadata) = crate::metadata::load_metadata() {
+            if let Some(sandbox) = metadata.sandboxes.get_mut(sandbox_id) {
+                sandbox.ip = Some(format!("10.200.0.{}", net_index));
+                let _ = crate::metadata::save_metadata(&metadata);
+            }
+        }
     }
 
     // Signal child that setup is complete — child unblocks immediately

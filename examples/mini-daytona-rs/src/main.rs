@@ -145,6 +145,7 @@ fn main() -> Result<()> {
                     created_at: Utc::now().to_rfc3339(),
                     dir: sandbox_dir.clone(),
                     pid: None,
+                    ip: None,
                 },
             );
             save_metadata(&metadata)?;

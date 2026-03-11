@@ -24,6 +24,8 @@ pub struct SandboxMetadata {
     /// PID of the sandbox init process (for nsenter-based exec)
     #[serde(default)]
     pub pid: Option<i32>,
+    #[serde(default)]
+    pub ip: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

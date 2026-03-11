@@ -54,6 +54,7 @@ pub fn run_sandbox(sandbox_id: &str, merged_dir: &str, cmd: &[&str], _limits: Op
         if let Ok(mut metadata) = crate::metadata::load_metadata() {
             if let Some(sandbox) = metadata.sandboxes.get_mut(sandbox_id) {
                 sandbox.pid = Some(child_pid);
+                sandbox.ip = Some("127.0.0.1".to_string());
                 let _ = crate::metadata::save_metadata(&metadata);
             }
         }

@@ -92,6 +92,19 @@ async function timedRequest(test, operation, method, route, body) {
   return result;
 }
 
+async function getSandboxUrl(sandboxId) {
+  let attempts = 0;
+  while (attempts < 5) {
+    const res = await request('GET', `/sandbox/${sandboxId}/info`);
+    if (res?.data?.success && res.data?.data?.ip) {
+      return `http://${res.data.data.ip}`;
+    }
+    attempts++;
+    await new Promise(r => setTimeout(r, 1000));
+  }
+  return null;
+}
+
 async function getServerCapabilities() {
   const fallback = {
     os: getLocalMacOSStatus() && !CLIENT_ONLY ? 'macos' : 'unknown',
@@ -221,6 +234,79 @@ async function runTests() {
   console.log('Read Response:', readRes.data);
   assert(readRes.data.success === true, 'File read failed');
   assert(readRes.data.data === 'console.log("Hello Node Integration Test!");', 'File content mismatch');
+
+  // 5.5 Start Nginx daemon and Test exposed URL
+  console.log('\n[5.5] Starting Nginx daemon and checking exposed URL...');
+  if (serverCapabilities.os === 'macos') {
+    console.log('[macOS] Skipping Nginx networking test because the linux nginx binary cannot run natively.');
+  } else {
+    const nginxExecRes = await timedRequest('Nginx', 'exec_daemon', 'POST', `/sandbox/${sandboxId}/exec`, {
+      cmd: ['sh', '-c', 'nginx >/dev/null 2>&1']
+    });
+    console.log('Nginx Exec Response:', nginxExecRes.data);
+    assert(nginxExecRes.data.success === true, 'Nginx exec failed');
+
+    // Wait for nginx to actually start
+    await new Promise(r => setTimeout(r, 1000));
+
+    const sandboxUrl = await getSandboxUrl(sandboxId);
+    assert(sandboxUrl, 'Failed to get sandbox URL');
+    console.log(`Sandbox URL retrieved: ${sandboxUrl}`);
+
+    console.log('\n[5.6] Fetching index.html from Sandbox URL via an external container (secondary sandbox)...');
+    
+    // Start Sandbox B (Client Sandbox)
+    console.log('\n  [5.6.1] Starting secondary sandbox as an external client...');
+    const clientStartRes = await timedRequest('Nginx', 'start_client', 'POST', '/start', {
+      snapshot: snapshotPath
+    });
+    assert(clientStartRes.data.success === true, 'Secondary client sandbox start failed');
+    const clientSandboxId = clientStartRes.data.data.sandbox_id;
+    
+    await new Promise(r => setTimeout(r, 1000));
+
+    console.log(`\n  [5.6.2] Executing wget inside secondary sandbox to fetch ${sandboxUrl}...`);
+    const fetchUrlStr = `http://${new URL(sandboxUrl).hostname}:80/`;
+    
+    const wgetRes = await timedRequest('Nginx', 'exec_client', 'POST', `/sandbox/${clientSandboxId}/exec`, {
+      cmd: ['wget', '-qO-', fetchUrlStr]
+    });
+    
+    console.log('Secondary Sandbox Wget Response:', wgetRes.data);
+    assert(wgetRes.data.success === true, 'Secondary sandbox exec failed');
+    
+    const pageContent = wgetRes.data.data.stdout || '';
+    console.log(`Fetched page content from external container: ${pageContent.trim()}`);
+    assert(pageContent.includes('Hello Mini Daytona'), 'Nginx content mismatch when accessed from an external container');
+
+    console.log('\n  [5.6.3] Destroying secondary client sandbox...');
+    await timedRequest('Nginx', 'destroy_client', 'DELETE', `/sandbox/${clientSandboxId}`);
+
+    console.log('\n[5.7] Fetching index.html directly from the Host environment...');
+    try {
+      const hostPageContent = await new Promise((resolve, reject) => {
+        const req = http.get(fetchUrlStr, { timeout: 3000 }, (res) => {
+          let data = '';
+          res.on('data', chunk => data += chunk);
+          res.on('end', () => resolve(data));
+        });
+        req.on('error', reject);
+        req.on('timeout', () => {
+          req.destroy();
+          reject(new Error('timeout'));
+        });
+      });
+      console.log(`Fetched page content from Host: ${hostPageContent.trim()}`);
+      assert(hostPageContent.includes('Hello Mini Daytona'), 'Host: Nginx content mismatch');
+    } catch (err) {
+      if (serverCapabilities.os === 'linux') {
+        // On Linux host or Linux Docker, host access should ideally work, or fail gracefully if network routing on host differs
+        console.warn(`[Warning] Host direct fetch failed (often expected on Mac Docker hosts): ${err.message}`);
+      } else {
+        throw err;
+      }
+    }
+  }
 
   // 6. Suspend Sandbox
   console.log('\n[6] Suspending Sandbox...');
