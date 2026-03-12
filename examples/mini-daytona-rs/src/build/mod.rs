@@ -4,23 +4,23 @@ pub mod cache;
 pub mod parser;
 pub mod registry;
 
-use self::cache::{compute_context_hash, compute_dockerfile_md5, publish_build_artifact, resolve_cached_build_artifact};
+use self::cache::{
+    compute_context_hash, compute_dockerfile_md5, publish_build_artifact,
+    resolve_cached_build_artifact,
+};
 use self::parser::{parse_dockerfile, Instruction};
 use self::registry::{pull_image, ImageReference};
 use crate::overlay::OverlayMount;
 use crate::sandbox::{run_sandbox, SandboxProfile};
 use crate::snapshot::{get_bases_dir, get_cache_dir};
+use anyhow::Result;
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
-use uuid::Uuid;
-use anyhow::Result;
 use tracing::info;
+use uuid::Uuid;
 
-pub fn build(
-    dockerfile_path: &Path,
-    context_dir: &Path,
-) -> Result<PathBuf> {
+pub fn build(dockerfile_path: &Path, context_dir: &Path) -> Result<PathBuf> {
     if let Some(cached_artifact) = resolve_cached_build_artifact(dockerfile_path, context_dir)? {
         return Ok(cached_artifact.snapshot_path);
     }
@@ -47,7 +47,13 @@ pub fn build(
                 // Use a deterministic cache key so repeated builds skip the pull
                 let cache_key = {
                     let mut hasher = Sha256::new();
-                    hasher.update(format!("{}/{}/{}", image_ref.registry, image_ref.repo, image_ref.tag).as_bytes());
+                    hasher.update(
+                        format!(
+                            "{}/{}/{}",
+                            image_ref.registry, image_ref.repo, image_ref.tag
+                        )
+                        .as_bytes(),
+                    );
                     format!("base-{:x}", hasher.finalize())
                 };
                 let layer_dir = bases_dir.join(&cache_key);
@@ -90,12 +96,7 @@ pub fn build(
                 )?;
                 overlay.mount()?;
 
-                crate::os::sys::build_instruction(
-                    cmd_str,
-                    &merged_dir,
-                    &_workdir,
-                    &env
-                )?;
+                crate::os::sys::build_instruction(cmd_str, &merged_dir, &_workdir, &env)?;
 
                 overlay.unmount()?;
 
@@ -228,7 +229,10 @@ fn compute_cache_key(lower_dirs: &[PathBuf], instruction: &str) -> String {
         // Include host Python version so cache invalidates when Python changes.
         // Native C-extension .so files are version-specific; a stale cache with
         // cpython-312 .so files breaks when exec uses Python 3.13.
-        if let Ok(out) = std::process::Command::new("python3").arg("--version").output() {
+        if let Ok(out) = std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+        {
             hasher.update(&out.stdout);
         }
     }

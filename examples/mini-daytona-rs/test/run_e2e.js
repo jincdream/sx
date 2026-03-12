@@ -46,6 +46,10 @@ function getLocalMacOSStatus() {
   return require('os').platform() === 'darwin';
 }
 
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
 async function request(method, route, body = null) {
   return new Promise((resolve, reject) => {
     const url = new URL(`${API_BASE}${route}`);
@@ -230,6 +234,94 @@ async function getSandboxUrl(sandboxId) {
   return null;
 }
 
+async function getSandboxInfo(sandboxId) {
+  const res = await request('GET', `/sandbox/${sandboxId}/info`);
+  if (!res?.data?.success || !res.data?.data) {
+    throw new Error(`Failed to get sandbox info for ${sandboxId}`);
+  }
+  return res.data.data;
+}
+
+function formatBytes(bytes) {
+  if (bytes == null) return 'n/a';
+  if (bytes === 0) return '0 B';
+  const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
+  let value = bytes;
+  let index = 0;
+  while (value >= 1024 && index < units.length - 1) {
+    value /= 1024;
+    index++;
+  }
+  const digits = value >= 100 || index === 0 ? 0 : value >= 10 ? 1 : 2;
+  return `${value.toFixed(digits)} ${units[index]}`;
+}
+
+function formatCpuLimit(resources = {}) {
+  if (resources.cpu_quota == null || resources.cpu_period == null || resources.cpu_period === 0) {
+    return 'n/a';
+  }
+  const cores = resources.cpu_quota / resources.cpu_period;
+  return `${cores.toFixed(2)} cores (${resources.cpu_quota}/${resources.cpu_period} us)`;
+}
+
+function formatCpuUsageWindow(firstInfo, secondInfo, intervalMs) {
+  const firstUsage = firstInfo?.stats?.cpu_usage_usec;
+  const secondUsage = secondInfo?.stats?.cpu_usage_usec;
+  if (firstUsage == null || secondUsage == null || secondUsage < firstUsage || intervalMs <= 0) {
+    return null;
+  }
+
+  const percentOfOneCore = ((secondUsage - firstUsage) / (intervalMs * 1000)) * 100;
+  const parts = [`${percentOfOneCore.toFixed(1)}% of 1 core`];
+
+  const quota = secondInfo?.resources?.cpu_quota;
+  const period = secondInfo?.resources?.cpu_period;
+  if (quota != null && period != null && period > 0) {
+    const quotaCores = quota / period;
+    if (quotaCores > 0) {
+      const percentOfQuota = percentOfOneCore / quotaCores;
+      parts.push(`${percentOfQuota.toFixed(1)}% of sandbox CPU quota`);
+    }
+  }
+
+  return parts.join(', ');
+}
+
+function printSandboxPerformance(label, infoA, infoB, intervalMs) {
+  const snapshot = infoB || infoA;
+  if (!snapshot) return;
+
+  const resources = snapshot.resources || {};
+  const stats = snapshot.stats || {};
+  const cpuDetails = [];
+  const cpuWindow = formatCpuUsageWindow(infoA, infoB, intervalMs);
+  if (cpuWindow) cpuDetails.push(cpuWindow);
+  if (stats.cpu_percent != null) cpuDetails.push(`${stats.cpu_percent.toFixed(1)}% instant`);
+  if (stats.cpu_usage_usec != null) cpuDetails.push(`${(stats.cpu_usage_usec / 1000).toFixed(1)} ms cumulative`);
+
+  console.log(`\n[Perf] ${label}`);
+  console.log(`  sandbox=${snapshot.id} pid=${snapshot.pid ?? 'n/a'} ip=${snapshot.ip ?? 'n/a'}`);
+  console.log(`  limits: memory=${formatBytes(resources.memory_bytes)}, cpu=${formatCpuLimit(resources)}, pids=${resources.pids_max ?? 'n/a'}, disk=${formatBytes(resources.disk_bytes)}`);
+  console.log(`  usage: memory=${formatBytes(stats.memory_current_bytes)}, peak=${formatBytes(stats.memory_peak_bytes)}, rss=${formatBytes(stats.process_resident_bytes)}, pids=${stats.pids_current ?? 'n/a'}`);
+  console.log(`  cpu: ${cpuDetails.length > 0 ? cpuDetails.join(', ') : 'n/a'}`);
+  if (stats.oom_kill_count > 0) {
+    console.log(`  ⚠️  OOM kills: ${stats.oom_kill_count}`);
+  }
+}
+
+async function captureSandboxPerformance(testName, sandboxId, label, intervalMs = 400) {
+  try {
+    const first = await getSandboxInfo(sandboxId);
+    await sleep(intervalMs);
+    const second = await getSandboxInfo(sandboxId);
+    printSandboxPerformance(`${testName} - ${label}`, first, second, intervalMs);
+    return second;
+  } catch (err) {
+    console.warn(`[Perf] ${testName} - ${label}: failed to collect stats: ${err.message}`);
+    return null;
+  }
+}
+
 async function getServerCapabilities() {
   const fallback = {
     os: getLocalMacOSStatus() && !CLIENT_ONLY ? 'macos' : 'unknown',
@@ -334,6 +426,7 @@ async function runTests() {
   assert(sandboxId, 'Sandbox ID is missing');
 
   await new Promise(r => setTimeout(r, 3000));
+  await captureSandboxPerformance('Nginx', sandboxId, 'after start');
 
   // 3. Exec 'ls -la'
   console.log('\n[3] Executing command in Sandbox...');
@@ -370,6 +463,7 @@ async function runTests() {
     });
     console.log('Nginx Exec Response:', nginxExecRes.data);
     assert(nginxExecRes.data.success === true, 'Nginx exec failed');
+    await captureSandboxPerformance('Nginx', sandboxId, 'after nginx daemon start');
 
     // Wait for nginx to actually start
     await new Promise(r => setTimeout(r, 1000));
@@ -463,6 +557,7 @@ async function runTests() {
 
   // 10. Destroy Sandbox
   console.log('\n[10] Destroying Sandbox...');
+  await captureSandboxPerformance('Nginx', sandboxId, 'before destroy');
   const destroyRes = await timedRequest('Nginx', 'destroy', 'DELETE', `/sandbox/${sandboxId}`);
   console.log('Destroy Response:', destroyRes.data);
   assert(destroyRes.data.success === true, 'Sandbox destroy failed');
@@ -499,6 +594,7 @@ async function runTests() {
   assert(pySandboxId, 'Python Sandbox ID is missing');
 
   await new Promise(r => setTimeout(r, 3000));
+  await captureSandboxPerformance('Python', pySandboxId, 'after start');
 
   // 3. Write Python Script
   console.log('\n[3] Writing Python Script to Sandbox...');
@@ -543,6 +639,7 @@ print(json.dumps(output))
     assert(pyExecRes.data.data.stdout.includes('"message": "Hello from Python!"'), 'Python output message mismatch');
     assert(pyExecRes.data.data.stdout.includes('"sum_of_squares": 55'), 'Python computation mismatch');
     assert(pyExecRes.data.data.stdout.includes('"date": "'), 'Python date output missing');
+    await captureSandboxPerformance('Python', pySandboxId, 'after script exec');
   }
 
   // 5. Destroy Sandbox (Python)
@@ -583,6 +680,7 @@ print(json.dumps(output))
   assert(daSandboxId, 'Data Analysis Sandbox ID is missing');
 
   await new Promise(r => setTimeout(r, 3000));
+  await captureSandboxPerformance('DataAnalysis', daSandboxId, 'after start');
 
   // 3. Write Python Script
   console.log('\n[3] Writing Data Analysis Script to Sandbox...');
@@ -618,6 +716,7 @@ print(json.dumps(result))
     assert(daExecRes.data.success === true, 'Data Analysis Exec failed');
     assert(daExecRes.data.data.stdout.includes('"message": "Data Analysis Test"'), 'Data Analysis output message mismatch');
     assert(daExecRes.data.data.stdout.includes('"A": 1'), 'Data Analysis output dataframe content mismatch');
+    await captureSandboxPerformance('DataAnalysis', daSandboxId, 'after script exec');
   }
 
   // 5. Destroy Sandbox (Data Analysis)
@@ -663,6 +762,7 @@ print(json.dumps(result))
   assert(ulSandboxId, 'Upload Test Sandbox ID is missing');
 
   await new Promise(r => setTimeout(r, 3000));
+  await captureSandboxPerformance('Upload', ulSandboxId, 'after start');
 
   // 3. Read dataset.xlsx from disk and upload via binary upload API
   console.log('\n[3] Uploading dataset.xlsx to sandbox...');
@@ -737,6 +837,7 @@ except Exception as e:
     assert(xlsxOutput.rows > 0, 'Xlsx has no rows');
     assert(xlsxOutput.columns.length > 0, 'Xlsx has no columns');
     console.log(`  Processed ${xlsxOutput.rows} rows, ${xlsxOutput.columns.length} columns`);
+    await captureSandboxPerformance('Upload', ulSandboxId, 'after xlsx processing');
   }
 
   // 6. Download the file back and verify it matches
@@ -776,6 +877,7 @@ except Exception as e:
 
   const rlSandboxId = rlStartRes.data.data.sandbox_id;
   await new Promise(r => setTimeout(r, 3000));
+  await captureSandboxPerformance('ResourceLimits', rlSandboxId, 'after start');
 
   // 2. Verify sandbox is functional with limited resources
   console.log('\n[2] Verifying sandbox with limited resources...');
@@ -788,6 +890,7 @@ except Exception as e:
     console.log('Resource Limits Exec Response:', rlExecRes.data);
     assert(rlExecRes.data.success === true, 'Resource Limits exec failed');
     assert(rlExecRes.data.data.stdout.includes('"status": "ok"'), 'Resource Limits output mismatch');
+    await captureSandboxPerformance('ResourceLimits', rlSandboxId, 'after limited-resource exec');
   }
 
   console.log('\n[3] Destroying Resource Limits Sandbox...');
@@ -830,6 +933,7 @@ except Exception as e:
   assert(pbSandboxId, 'Puppeteer Sandbox ID is missing');
 
   await new Promise(r => setTimeout(r, 3000));
+  await captureSandboxPerformance('Puppeteer', pbSandboxId, 'after start');
 
   // 3. Write Puppeteer Script
   console.log('\n[3] Writing Puppeteer Script to Sandbox...');
@@ -853,6 +957,7 @@ except Exception as e:
     assert(pbExecRes.data.success === true, 'Puppeteer Exec failed');
     assert(pbExecRes.data.data.stdout.includes('Browser closed successfully!'), 'Puppeteer output missing success message');
     assert(pbExecRes.data.data.stdout.includes('Page title:'), 'Puppeteer title missing message');
+    await captureSandboxPerformance('Puppeteer', pbSandboxId, 'after puppeteer exec');
   }
 
   // 5. Destroy Sandbox (Puppeteer)
@@ -895,6 +1000,7 @@ except Exception as e:
   assert(nextSandboxId, 'Next.js Sandbox ID is missing');
 
   await new Promise(r => setTimeout(r, 3000));
+  await captureSandboxPerformance('Next.js', nextSandboxId, 'after start');
 
   // 3. Create Next.js App
   console.log('\\n[3] Creating Next.js App (this may take a minute)...');
@@ -967,6 +1073,7 @@ except Exception as e:
   console.log('Host proxy response length:', proxyContent.length);
   console.log('Host proxy preview:', proxyContent.substring(0, 200));
   assert(proxyContent.includes('Hello Next.js Daytona!'), 'Next.js content mismatch via host proxy');
+  await captureSandboxPerformance('Next.js', nextSandboxId, 'after dev server ready');
 
   console.log('\n[7] Destroying Next.js Sandbox...');
   const nextDestroyRes = await timedRequest('Next.js', 'destroy', 'DELETE', `/sandbox/${nextSandboxId}`);

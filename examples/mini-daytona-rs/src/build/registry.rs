@@ -2,13 +2,10 @@ use reqwest::blocking::{Client, Response};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
 use std::path::PathBuf;
-use tracing::{info, debug, warn};
+use tracing::{debug, info, warn};
 
 /// Mirror list, tried in order. Override with env DOCKER_MIRROR.
-const DEFAULT_MIRRORS: &[&str] = &[
-    "docker.m.daocloud.io",
-    "docker.1ms.run",
-];
+const DEFAULT_MIRRORS: &[&str] = &["docker.m.daocloud.io", "docker.1ms.run"];
 
 /// Max retry attempts per request (for transient 404 / 5xx / network errors).
 const MAX_REQUEST_ATTEMPTS: u32 = 3;
@@ -119,7 +116,12 @@ fn parse_www_authenticate(header_val: &str) -> Option<(String, String, String)> 
 }
 
 /// Fetch an anonymous token from the registry's auth endpoint.
-fn fetch_anonymous_token(client: &Client, realm: &str, service: &str, scope: &str) -> anyhow::Result<String> {
+fn fetch_anonymous_token(
+    client: &Client,
+    realm: &str,
+    service: &str,
+    scope: &str,
+) -> anyhow::Result<String> {
     let mut url = format!("{}?", realm);
     if !service.is_empty() {
         url.push_str(&format!("service={}&", service));
@@ -144,7 +146,11 @@ fn registry_request(
 
     if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
         // Try to get a token from the Www-Authenticate header
-        if let Some(www_auth) = resp.headers().get("www-authenticate").and_then(|v| v.to_str().ok()) {
+        if let Some(www_auth) = resp
+            .headers()
+            .get("www-authenticate")
+            .and_then(|v| v.to_str().ok())
+        {
             debug!("Got 401, Www-Authenticate: {}", www_auth);
             if let Some((realm, service, scope)) = parse_www_authenticate(www_auth) {
                 let new_token = fetch_anonymous_token(client, &realm, &service, &scope)?;
@@ -205,7 +211,12 @@ fn registry_request_retry(
     for attempt in 0..MAX_REQUEST_ATTEMPTS {
         if attempt > 0 {
             let delay_secs = 2u64.pow(attempt);
-            warn!("  Retry {}/{} in {}s...", attempt, MAX_REQUEST_ATTEMPTS - 1, delay_secs);
+            warn!(
+                "  Retry {}/{} in {}s...",
+                attempt,
+                MAX_REQUEST_ATTEMPTS - 1,
+                delay_secs
+            );
             std::thread::sleep(std::time::Duration::from_secs(delay_secs));
         }
         match registry_request(client, url, accept, token) {
@@ -230,7 +241,13 @@ fn registry_request_retry(
             }
         }
     }
-    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("All {} attempts exhausted for {}", MAX_REQUEST_ATTEMPTS, url)))
+    Err(last_err.unwrap_or_else(|| {
+        anyhow::anyhow!(
+            "All {} attempts exhausted for {}",
+            MAX_REQUEST_ATTEMPTS,
+            url
+        )
+    }))
 }
 
 /// Pull image with automatic mirror fallback.
@@ -254,14 +271,30 @@ pub fn pull_image(image_ref: &ImageReference, dest_dir: &PathBuf) -> anyhow::Res
                 }
             }
         }
-        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("All mirrors failed for {}/{}", image_ref.repo, image_ref.tag)))
+        Err(last_err.unwrap_or_else(|| {
+            anyhow::anyhow!(
+                "All mirrors failed for {}/{}",
+                image_ref.repo,
+                image_ref.tag
+            )
+        }))
     } else {
-        pull_image_from(&image_ref.registry, &image_ref.repo, &image_ref.tag, dest_dir)
+        pull_image_from(
+            &image_ref.registry,
+            &image_ref.repo,
+            &image_ref.tag,
+            dest_dir,
+        )
     }
 }
 
 /// Internal: pull image from a specific registry.
-fn pull_image_from(registry: &str, repo: &str, tag: &str, dest_dir: &PathBuf) -> anyhow::Result<()> {
+fn pull_image_from(
+    registry: &str,
+    repo: &str,
+    tag: &str,
+    dest_dir: &PathBuf,
+) -> anyhow::Result<()> {
     fs::create_dir_all(dest_dir)?;
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(300))
@@ -275,10 +308,15 @@ fn pull_image_from(registry: &str, repo: &str, tag: &str, dest_dir: &PathBuf) ->
     // Fetch manifest (handles 401 + anonymous token automatically)
     let manifest_url = format!("https://{}/v2/{}/manifests/{}", registry, repo, tag);
     let manifest_accept = "application/vnd.docker.distribution.manifest.v2+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.oci.image.index.v1+json";
-    let manifest_resp = registry_request_retry(&client, &manifest_url, manifest_accept, &mut token)?;
+    let manifest_resp =
+        registry_request_retry(&client, &manifest_url, manifest_accept, &mut token)?;
 
     if !manifest_resp.status().is_success() {
-        anyhow::bail!("Failed to fetch manifest: HTTP {} from {}", manifest_resp.status(), manifest_url);
+        anyhow::bail!(
+            "Failed to fetch manifest: HTTP {} from {}",
+            manifest_resp.status(),
+            manifest_url
+        );
     }
 
     let mut manifest: Manifest = manifest_resp.json()?;
@@ -302,14 +340,21 @@ fn pull_image_from(registry: &str, repo: &str, tag: &str, dest_dir: &PathBuf) ->
             }
         }
 
-        info!("Resolved platform manifest: {} ({})", hit_digest, target_arch);
+        info!(
+            "Resolved platform manifest: {} ({})",
+            hit_digest, target_arch
+        );
 
         let resolved_url = format!("https://{}/v2/{}/manifests/{}", registry, repo, hit_digest);
         let resolved_accept = "application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json";
-        let resolved_resp = registry_request_retry(&client, &resolved_url, resolved_accept, &mut token)?;
+        let resolved_resp =
+            registry_request_retry(&client, &resolved_url, resolved_accept, &mut token)?;
 
         if !resolved_resp.status().is_success() {
-            anyhow::bail!("Failed to fetch resolved manifest: HTTP {}", resolved_resp.status());
+            anyhow::bail!(
+                "Failed to fetch resolved manifest: HTTP {}",
+                resolved_resp.status()
+            );
         }
         manifest = resolved_resp.json()?;
     }
@@ -329,7 +374,11 @@ fn pull_image_from(registry: &str, repo: &str, tag: &str, dest_dir: &PathBuf) ->
         let mut resp = registry_request_retry(&client, &blob_url, "*/*", &mut token)?;
 
         if !resp.status().is_success() {
-            anyhow::bail!("Failed to download layer {}: HTTP {}", layer.digest, resp.status());
+            anyhow::bail!(
+                "Failed to download layer {}: HTTP {}",
+                layer.digest,
+                resp.status()
+            );
         }
 
         let layer_path = dest_dir.join(format!("layer-{}.tar.gz", &layer.digest[7..15]));

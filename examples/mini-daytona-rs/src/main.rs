@@ -1,22 +1,24 @@
-use clap::Parser;
-use std::path::PathBuf;
 use anyhow::{Context, Result};
 use chrono::Utc;
-use tracing::{info, warn, error, debug};
+use clap::Parser;
+use std::path::PathBuf;
+use tracing::{debug, error, info, warn};
 use tracing_subscriber::{EnvFilter, FmtSubscriber};
 use uuid::Uuid;
 
 mod build;
 mod metadata;
 mod netns;
+mod os;
 mod overlay;
 mod sandbox;
-mod os;
-mod snapshot;
 mod server;
+mod snapshot;
 
 use build::build;
-use build::cache::{list_build_artifacts, prune_build_artifacts, BuildCachePruneMode, BuildCacheScope};
+use build::cache::{
+    list_build_artifacts, prune_build_artifacts, BuildCachePruneMode, BuildCacheScope,
+};
 use metadata::{load_metadata, register_snapshot, save_metadata, SandboxMetadata};
 use overlay::OverlayMount;
 use sandbox::run_sandbox;
@@ -28,7 +30,12 @@ use snapshot::{create_archive, extract_archive, get_sandboxes_dir};
 struct Cli {
     #[command(subcommand)]
     command: Commands,
-    #[arg(short, long, global = true, help = "设置日志级别 (e.g., debug, info, warn, error)")]
+    #[arg(
+        short,
+        long,
+        global = true,
+        help = "设置日志级别 (e.g., debug, info, warn, error)"
+    )]
     log_level: Option<String>,
 }
 
@@ -41,14 +48,9 @@ enum Commands {
         context: PathBuf,
     },
     /// 从快照启动一个容器沙箱
-    Start {
-        snapshot: PathBuf,
-    },
+    Start { snapshot: PathBuf },
     /// 将当前沙箱打包为快照
-    Snapshot {
-        sandbox_id: String,
-        output: PathBuf,
-    },
+    Snapshot { sandbox_id: String, output: PathBuf },
     /// 列出所有快照与沙箱
     List,
     /// 管理全局 build artifact 缓存
@@ -57,9 +59,7 @@ enum Commands {
         command: CacheCommands,
     },
     /// 销毁指定的沙箱环境
-    Destroy {
-        sandbox_id: String,
-    },
+    Destroy { sandbox_id: String },
     /// 启动 API Server (3000端口)
     Server,
 }
@@ -93,18 +93,20 @@ fn setup_logging(level: &Option<String>) {
         .with_thread_ids(false)
         .finish();
 
-    tracing::subscriber::set_global_default(subscriber)
-        .expect("Failed to initialize logging");
+    tracing::subscriber::set_global_default(subscriber).expect("Failed to initialize logging");
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
     setup_logging(&cli.log_level);
-    
+
     debug!("Starting mini-daytona-rs...");
 
     match &cli.command {
-        Commands::Build { dockerfile, context } => {
+        Commands::Build {
+            dockerfile,
+            context,
+        } => {
             info!("Building from Dockerfile: {:?}", dockerfile);
             let snapshot_path = build(dockerfile, context).context("Failed to build snapshot")?;
             info!("Snapshot created: {:?}", snapshot_path);
@@ -128,12 +130,9 @@ fn main() -> Result<()> {
             let merged_dir = sandbox_dir.join("merged");
 
             debug!("Mounting overlay directories");
-            let overlay = OverlayMount::new(
-                vec![base_dir],
-                upper_dir,
-                work_dir,
-                merged_dir.clone(),
-            ).context("Failed to prepare overlay mount")?;
+            let overlay =
+                OverlayMount::new(vec![base_dir], upper_dir, work_dir, merged_dir.clone())
+                    .context("Failed to prepare overlay mount")?;
             overlay.mount().context("Failed to mount overlay")?;
 
             let mut metadata = load_metadata()?;
@@ -146,12 +145,20 @@ fn main() -> Result<()> {
                     dir: sandbox_dir.clone(),
                     pid: None,
                     ip: None,
+                    resources: sandbox::ResourceLimits::default(),
                 },
             );
             save_metadata(&metadata)?;
 
             info!("Starting sandbox execution: {}", sandbox_id);
-            if let Err(e) = run_sandbox(&sandbox_id, merged_dir.to_str().unwrap(), &[], None, None, sandbox::SandboxProfile::Runtime) {
+            if let Err(e) = run_sandbox(
+                &sandbox_id,
+                merged_dir.to_str().unwrap(),
+                &[],
+                None,
+                None,
+                sandbox::SandboxProfile::Runtime,
+            ) {
                 error!("Sandbox {} failed: {}", sandbox_id, e);
             }
 
@@ -162,7 +169,10 @@ fn main() -> Result<()> {
             let metadata = load_metadata()?;
             if let Some(sandbox) = metadata.sandboxes.get(sandbox_id) {
                 let merged_dir = sandbox.dir.join("merged");
-                info!("Creating snapshot from sandbox {} to {:?}", sandbox_id, output);
+                info!(
+                    "Creating snapshot from sandbox {} to {:?}",
+                    sandbox_id, output
+                );
                 create_archive(&merged_dir, output).context("Failed to create archive")?;
                 info!("Snapshot successfully saved to: {:?}", output);
             } else {
@@ -194,7 +204,10 @@ fn main() -> Result<()> {
                     );
                 }
             }
-            CacheCommands::Prune { dockerfile_md5, cache_key } => {
+            CacheCommands::Prune {
+                dockerfile_md5,
+                cache_key,
+            } => {
                 let mode = if let Some(cache_key) = cache_key.clone() {
                     BuildCachePruneMode::Scope(BuildCacheScope::CacheKey(cache_key))
                 } else if let Some(dockerfile_md5) = dockerfile_md5.clone() {
@@ -206,7 +219,10 @@ fn main() -> Result<()> {
                 let removed = prune_build_artifacts(mode)?;
                 info!("Pruned {} build artifact cache entrie(s)", removed.len());
                 for artifact in removed {
-                    println!("removed {} -> {:?}", artifact.cache_key, artifact.snapshot_path);
+                    println!(
+                        "removed {} -> {:?}",
+                        artifact.cache_key, artifact.snapshot_path
+                    );
                 }
             }
             CacheCommands::Clear => {
@@ -219,19 +235,21 @@ fn main() -> Result<()> {
             if let Some(sandbox) = metadata.sandboxes.remove(sandbox_id) {
                 debug!("Destroying sandbox: {}", sandbox_id);
                 let merged_dir = sandbox.dir.join("merged");
-                
+
                 // Attempt to quietly unmount first just in case
                 let overlay = OverlayMount::new(
                     vec![],
                     sandbox.dir.join("upper"),
                     sandbox.dir.join("work"),
                     merged_dir,
-                ).ok();
+                )
+                .ok();
                 if let Some(mnt) = overlay {
                     let _ = mnt.unmount();
                 }
 
-                std::fs::remove_dir_all(&sandbox.dir).context("Failed to clean up sandbox directory")?;
+                std::fs::remove_dir_all(&sandbox.dir)
+                    .context("Failed to clean up sandbox directory")?;
                 save_metadata(&metadata)?;
                 info!("Successfully destroyed sandbox: {}", sandbox_id);
             } else {

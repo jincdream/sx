@@ -31,7 +31,7 @@ impl OverlayMount {
             &self.merged_dir,
             &self.lower_dirs,
             &self.upper_dir,
-            &self.work_dir
+            &self.work_dir,
         )
     }
 
@@ -53,4 +53,3 @@ impl OverlayMount {
         Ok(())
     }
 }
-

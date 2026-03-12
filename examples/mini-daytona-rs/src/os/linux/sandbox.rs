@@ -6,14 +6,21 @@ use nix::sys::wait::waitpid;
 use nix::unistd::{chdir, execvp, pivot_root, sethostname};
 use std::ffi::CString;
 use std::fs;
-use tracing::{info, warn, error};
+use tracing::{error, info, warn};
 
 use crate::os::sys::netns;
 use crate::sandbox::{ResourceLimits, SandboxProfile};
 
 const STACK_SIZE: usize = 1024 * 1024;
 
-pub fn run_sandbox(sandbox_id: &str, merged_dir: &str, cmd: &[&str], limits: Option<&ResourceLimits>, workdir: Option<&str>, profile: SandboxProfile) -> anyhow::Result<()> {
+pub fn run_sandbox(
+    sandbox_id: &str,
+    merged_dir: &str,
+    cmd: &[&str],
+    limits: Option<&ResourceLimits>,
+    workdir: Option<&str>,
+    profile: SandboxProfile,
+) -> anyhow::Result<()> {
     let mut stack = vec![0u8; STACK_SIZE];
 
     let flags = CloneFlags::CLONE_NEWNS
@@ -47,7 +54,12 @@ pub fn run_sandbox(sandbox_id: &str, merged_dir: &str, cmd: &[&str], limits: Opt
                 libc::read(read_fd, buf.as_mut_ptr() as *mut libc::c_void, 1);
                 libc::close(read_fd);
 
-                if let Err(e) = child(merged_dir_c.as_c_str(), &cmd_c, workdir_c.as_deref(), profile) {
+                if let Err(e) = child(
+                    merged_dir_c.as_c_str(),
+                    &cmd_c,
+                    workdir_c.as_deref(),
+                    profile,
+                ) {
                     eprintln!("Child error: {}", e);
                     std::process::exit(1);
                 }
@@ -184,7 +196,10 @@ fn setup_cgroups(sandbox_id: &str, pid: i32, limits: &ResourceLimits) -> anyhow:
         format!("{}/cgroup.subtree_control", cg_base),
         "+memory +pids +cpu",
     ) {
-        warn!("Failed to enable mini-daytona cgroup subtree controllers: {}", e);
+        warn!(
+            "Failed to enable mini-daytona cgroup subtree controllers: {}",
+            e
+        );
     }
 
     // Step 4: Create the cgroup for this sandbox
@@ -205,14 +220,20 @@ fn setup_cgroups(sandbox_id: &str, pid: i32, limits: &ResourceLimits) -> anyhow:
     // Set cpu limit: quota period
     let quota = limits.cpu_quota.unwrap_or(100_000);
     let period = limits.cpu_period.unwrap_or(100_000);
-    if let Err(e) = fs::write(format!("{}/cpu.max", cg_path), format!("{} {}", quota, period)) {
+    if let Err(e) = fs::write(
+        format!("{}/cpu.max", cg_path),
+        format!("{} {}", quota, period),
+    ) {
         warn!("Failed to set cpu limit: {}", e);
     }
 
     // Write PID to cgroup.procs
     fs::write(format!("{}/cgroup.procs", cg_path), pid.to_string())?;
 
-    info!("Cgroups configured for {}: memory={}B, cpu={}/{}, pids={}", sandbox_id, mem, quota, period, pids);
+    info!(
+        "Cgroups configured for {}: memory={}B, cpu={}/{}, pids={}",
+        sandbox_id, mem, quota, period, pids
+    );
     Ok(())
 }
 
@@ -224,7 +245,12 @@ fn cleanup_cgroups(sandbox_id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn child(merged_dir: &std::ffi::CStr, cmd: &[CString], workdir: Option<&std::ffi::CStr>, profile: SandboxProfile) -> anyhow::Result<()> {
+fn child(
+    merged_dir: &std::ffi::CStr,
+    cmd: &[CString],
+    workdir: Option<&std::ffi::CStr>,
+    profile: SandboxProfile,
+) -> anyhow::Result<()> {
     sethostname("mini-daytona")?;
 
     // Make all mounts slave so changes don't propagate to the host,
@@ -235,7 +261,8 @@ fn child(merged_dir: &std::ffi::CStr, cmd: &[CString], workdir: Option<&std::ffi
         None::<&str>,
         MsFlags::MS_SLAVE | MsFlags::MS_REC,
         None::<&str>,
-    ).map_err(|e| anyhow::anyhow!("MS_SLAVE mount failed: {}", e))?;
+    )
+    .map_err(|e| anyhow::anyhow!("MS_SLAVE mount failed: {}", e))?;
 
     let new_root = merged_dir.to_str()?;
 
@@ -246,7 +273,8 @@ fn child(merged_dir: &std::ffi::CStr, cmd: &[CString], workdir: Option<&std::ffi
         None::<&str>,
         MsFlags::MS_BIND | MsFlags::MS_REC,
         None::<&str>,
-    ).map_err(|e| anyhow::anyhow!("bind mount {} failed: {}", new_root, e))?;
+    )
+    .map_err(|e| anyhow::anyhow!("bind mount {} failed: {}", new_root, e))?;
 
     // Setup /dev with essential device nodes by bind-mounting from host
     setup_dev(new_root)?;
@@ -268,10 +296,7 @@ fn child(merged_dir: &std::ffi::CStr, cmd: &[CString], workdir: Option<&std::ffi
 
     // Create a directory inside the new root to serve as the put_old mount point
     let put_old = format!("{}/.pivot_old", new_root);
-    let _ = nix::unistd::mkdir(
-        put_old.as_str(),
-        Mode::S_IRWXU,
-    );
+    let _ = nix::unistd::mkdir(put_old.as_str(), Mode::S_IRWXU);
 
     // pivot_root: swap root filesystem
     pivot_root(new_root, put_old.as_str())
@@ -318,7 +343,10 @@ fn child(merged_dir: &std::ffi::CStr, cmd: &[CString], workdir: Option<&std::ffi
             //    be truly immutable (no process can add_rule after this).
             let ret = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
             if ret != 0 {
-                warn!("Failed to set PR_SET_NO_NEW_PRIVS: errno {}", nix::errno::errno());
+                warn!(
+                    "Failed to set PR_SET_NO_NEW_PRIVS: errno {}",
+                    nix::errno::errno()
+                );
             }
             // 3. Apply runtime seccomp profile (base whitelist minus runtime denylist).
             if let Err(e) = setup_seccomp(profile) {
@@ -461,7 +489,8 @@ fn setup_dev(new_root: &str) -> anyhow::Result<()> {
         Some("tmpfs"),
         MsFlags::MS_NOSUID | MsFlags::MS_STRICTATIME,
         Some("mode=755,size=65536k"),
-    ).map_err(|e| anyhow::anyhow!("Failed to mount tmpfs on {}: {}", dev_dir, e))?;
+    )
+    .map_err(|e| anyhow::anyhow!("Failed to mount tmpfs on {}: {}", dev_dir, e))?;
 
     // Essential device nodes to bind-mount from host
     let devices = [
@@ -491,7 +520,10 @@ fn setup_dev(new_root: &str) -> anyhow::Result<()> {
             MsFlags::MS_BIND,
             None::<&str>,
         ) {
-            warn!("Could not bind-mount {} -> {}: {}", host_path, target_path, e);
+            warn!(
+                "Could not bind-mount {} -> {}: {}",
+                host_path, target_path, e
+            );
         }
     }
 
@@ -532,9 +564,9 @@ fn drop_capabilities() -> anyhow::Result<()> {
 }
 
 fn setup_seccomp(profile: SandboxProfile) -> anyhow::Result<()> {
-    use libseccomp::{ScmpAction, ScmpFilterContext, ScmpSyscall};
-    use crate::os::linux::seccomp_whitelist::SECCOMP_WHITELIST;
     use crate::os::linux::seccomp_whitelist::SECCOMP_RUNTIME_DENYLIST;
+    use crate::os::linux::seccomp_whitelist::SECCOMP_WHITELIST;
+    use libseccomp::{ScmpAction, ScmpFilterContext, ScmpSyscall};
 
     // Default action is ERRNO(EPERM) to turn on whitelist mode
     let mut ctx = ScmpFilterContext::new_filter(ScmpAction::Errno(libc::EPERM))?;

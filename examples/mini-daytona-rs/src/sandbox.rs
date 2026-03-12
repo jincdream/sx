@@ -47,15 +47,14 @@ pub struct ResourceLimits {
 impl Default for ResourceLimits {
     fn default() -> Self {
         Self {
-            memory_bytes: Some(1_073_741_824),  // 1 GiB
-            cpu_quota: Some(100_000),            // 1 core
+            memory_bytes: Some(1_073_741_824), // 1 GiB
+            cpu_quota: Some(100_000),          // 1 core
             cpu_period: Some(100_000),
             pids_max: Some(512),
-            disk_bytes: Some(2_147_483_648),     // 2 GiB
+            disk_bytes: Some(2_147_483_648), // 2 GiB
         }
     }
 }
 
 // Re-export the platform-specific run_sandbox at the module level
 pub use crate::os::sys::run_sandbox;
-

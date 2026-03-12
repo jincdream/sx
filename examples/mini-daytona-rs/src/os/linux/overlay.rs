@@ -3,13 +3,18 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use tracing::info;
 
-pub fn mount_overlay(merged_dir: &Path, lower_dirs: &[PathBuf], upper_dir: &Path, work_dir: &Path) -> anyhow::Result<()> {
+pub fn mount_overlay(
+    merged_dir: &Path,
+    lower_dirs: &[PathBuf],
+    upper_dir: &Path,
+    work_dir: &Path,
+) -> anyhow::Result<()> {
     fs::create_dir_all(upper_dir)?;
     fs::create_dir_all(work_dir)?;
     fs::create_dir_all(merged_dir)?;
 
     info!("Mounting overlayfs at {:?}", merged_dir);
-    
+
     let base_data = format!(
         "upperdir={},workdir={}",
         upper_dir.to_str().unwrap(),
@@ -25,9 +30,9 @@ pub fn mount_overlay(merged_dir: &Path, lower_dirs: &[PathBuf], upper_dir: &Path
             .join(":");
         format!("lowerdir={}", lower_str)
     } else {
-         let dummy_lower = work_dir.parent().unwrap().join("empty_lower");
-         fs::create_dir_all(&dummy_lower)?;
-         format!("lowerdir={}", dummy_lower.to_str().unwrap())
+        let dummy_lower = work_dir.parent().unwrap().join("empty_lower");
+        fs::create_dir_all(&dummy_lower)?;
+        format!("lowerdir={}", dummy_lower.to_str().unwrap())
     };
 
     let data_with_xattr = format!("{},userxattr,{}", lower_part, base_data);

@@ -21,7 +21,10 @@ pub fn build_instruction(
     // work on macOS.  Packages that need native deps (e.g. Chromium)
     // should use platform-native installers (npm bundled downloads, brew, etc.).
     if cmd_str.contains("apt-get") || cmd_str.contains("dpkg") || cmd_str.contains("apt ") {
-        info!("[macOS] Skipping Linux-only package manager command: {}", cmd_str);
+        info!(
+            "[macOS] Skipping Linux-only package manager command: {}",
+            cmd_str
+        );
         return Ok(());
     }
 
@@ -62,10 +65,15 @@ pub fn build_instruction(
     // Replace bare pip/pip3 with python3 -m pip to ensure pip
     // uses the same Python version that python3 resolves to.
     let safe_cmd = if safe_cmd.starts_with("pip3 ") || safe_cmd.starts_with("pip ") {
-        safe_cmd.replacen(safe_cmd.split_whitespace().next().unwrap(), "python3 -m pip", 1)
+        safe_cmd.replacen(
+            safe_cmd.split_whitespace().next().unwrap(),
+            "python3 -m pip",
+            1,
+        )
     } else {
-        safe_cmd.replace(" && pip3 ", " && python3 -m pip ")
-              .replace(" && pip ", " && python3 -m pip ")
+        safe_cmd
+            .replace(" && pip3 ", " && python3 -m pip ")
+            .replace(" && pip ", " && python3 -m pip ")
     };
 
     // On macOS, strip --ignore-scripts from npm install so that

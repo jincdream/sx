@@ -1,10 +1,20 @@
 use std::process::Command;
 use tracing::info;
 
-use crate::sandbox::{SandboxProfile, ResourceLimits};
+use crate::sandbox::{ResourceLimits, SandboxProfile};
 
-pub fn run_sandbox(sandbox_id: &str, merged_dir: &str, cmd: &[&str], _limits: Option<&ResourceLimits>, workdir: Option<&str>, _profile: SandboxProfile) -> anyhow::Result<()> {
-    info!("[macOS] Starting sandbox {} (no isolation — development mode)", sandbox_id);
+pub fn run_sandbox(
+    sandbox_id: &str,
+    merged_dir: &str,
+    cmd: &[&str],
+    _limits: Option<&ResourceLimits>,
+    workdir: Option<&str>,
+    _profile: SandboxProfile,
+) -> anyhow::Result<()> {
+    info!(
+        "[macOS] Starting sandbox {} (no isolation — development mode)",
+        sandbox_id
+    );
     info!("[macOS] merged_dir = {}", merged_dir);
 
     if cmd.is_empty() {
@@ -35,7 +45,8 @@ pub fn run_sandbox(sandbox_id: &str, merged_dir: &str, cmd: &[&str], _limits: Op
 
     // For "tail -f /dev/null" style keep-alive, spawn a long-running child
     // and save its PID so exec can target it later.
-    let is_keepalive = cmd.len() >= 3 && cmd[0] == "tail" && cmd[1] == "-f" && cmd[2] == "/dev/null";
+    let is_keepalive =
+        cmd.len() >= 3 && cmd[0] == "tail" && cmd[1] == "-f" && cmd[2] == "/dev/null";
 
     if is_keepalive {
         // On macOS we use a simple sleep loop. The sandbox merged_dir is just
@@ -77,8 +88,7 @@ pub fn run_sandbox(sandbox_id: &str, merged_dir: &str, cmd: &[&str], _limits: Op
         }
     } else {
         cmd[0].to_string()
-    }
-    ;
+    };
 
     let actual_workdir = if let Some(wd) = workdir {
         if wd.starts_with('/') {
@@ -88,13 +98,17 @@ pub fn run_sandbox(sandbox_id: &str, merged_dir: &str, cmd: &[&str], _limits: Op
         }
     } else {
         merged_dir.to_string()
-    }
-    ;
+    };
 
     // Ensure workdir exists
     let _ = std::fs::create_dir_all(&actual_workdir);
 
-    info!("[macOS] Running (sandbox-exec): {} {:?} in {}", effective_cmd, &cmd[1..], actual_workdir);
+    info!(
+        "[macOS] Running (sandbox-exec): {} {:?} in {}",
+        effective_cmd,
+        &cmd[1..],
+        actual_workdir
+    );
 
     let profile_content = format!(
         "(version 1)\n\
@@ -125,18 +139,27 @@ pub fn run_sandbox(sandbox_id: &str, merged_dir: &str, cmd: &[&str], _limits: Op
         })
         .unwrap_or_default();
 
-    let host_path = std::env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin".to_string());
+    let host_path = std::env::var("PATH")
+        .unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin".to_string());
     let mut run = Command::new("sandbox-exec");
     run.arg("-f")
         .arg(&profile_path)
         .arg(&effective_cmd)
         .args(&cmd[1..])
         .current_dir(&actual_workdir)
-        .env("PATH", format!("{}:{}/usr/local/sbin:{}/usr/local/bin:{}/usr/sbin:{}/usr/bin:{}/sbin:{}/bin",
-            host_path, merged_dir, merged_dir, merged_dir, merged_dir, merged_dir, merged_dir))
+        .env(
+            "PATH",
+            format!(
+                "{}:{}/usr/local/sbin:{}/usr/local/bin:{}/usr/sbin:{}/usr/bin:{}/sbin:{}/bin",
+                host_path, merged_dir, merged_dir, merged_dir, merged_dir, merged_dir, merged_dir
+            ),
+        )
         .env("HOME", format!("{}/root", merged_dir))
         .env("TMPDIR", format!("{}/tmp", merged_dir))
-        .env("NODE_PATH", format!("{}/usr/local/lib/node_modules", merged_dir));
+        .env(
+            "NODE_PATH",
+            format!("{}/usr/local/lib/node_modules", merged_dir),
+        );
 
     if !python_path.is_empty() {
         run.env("PYTHONPATH", &python_path);

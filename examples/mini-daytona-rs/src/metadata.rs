@@ -1,5 +1,6 @@
-use serde::{Deserialize, Serialize};
+use crate::sandbox::ResourceLimits;
 use chrono::Utc;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
@@ -26,6 +27,8 @@ pub struct SandboxMetadata {
     pub pid: Option<i32>,
     #[serde(default)]
     pub ip: Option<String>,
+    #[serde(default)]
+    pub resources: ResourceLimits,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

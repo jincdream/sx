@@ -1,8 +1,8 @@
+use crate::metadata::SandboxMetadata;
+use crate::server::{SandboxRuntimeStatsResponse, ServerInfoResponse};
 use std::path::Path;
 use std::process::{Command, Output};
 use tracing::info;
-use crate::metadata::SandboxMetadata;
-use crate::server::ServerInfoResponse;
 
 pub fn get_server_info() -> ServerInfoResponse {
     ServerInfoResponse {
@@ -12,12 +12,46 @@ pub fn get_server_info() -> ServerInfoResponse {
     }
 }
 
+pub fn read_oom_kill_count(_sandbox_id: &str) -> Option<u64> {
+    None
+}
+
+pub fn get_sandbox_metrics(sandbox: &SandboxMetadata) -> SandboxRuntimeStatsResponse {
+    let mut stats = SandboxRuntimeStatsResponse::default();
+
+    if let Some(pid) = sandbox.pid {
+        let output = Command::new("ps")
+            .args(["-o", "rss=,%cpu=", "-p", &pid.to_string()])
+            .output();
+
+        if let Ok(output) = output {
+            if output.status.success() {
+                let text = String::from_utf8_lossy(&output.stdout);
+                let parts: Vec<&str> = text.split_whitespace().collect();
+                if let Some(rss_kb) = parts.first().and_then(|value| value.parse::<u64>().ok()) {
+                    stats.process_resident_bytes = Some(rss_kb * 1024);
+                }
+                if let Some(cpu_percent) = parts.get(1).and_then(|value| value.parse::<f64>().ok())
+                {
+                    stats.cpu_percent = Some(cpu_percent);
+                }
+            }
+        }
+    }
+
+    stats
+}
+
 pub fn destroy_sandbox_os(_sandbox: &SandboxMetadata, _merged_dir: &Path) {
     // On macOS there's no real mount; skip the expensive merged→upper copy
     // since we're about to delete everything anyway.
 }
 
-pub fn exec_sandbox(sandbox: &SandboxMetadata, cmd: &[String], env_vars: &[String]) -> anyhow::Result<Output> {
+pub fn exec_sandbox(
+    sandbox: &SandboxMetadata,
+    cmd: &[String],
+    env_vars: &[String],
+) -> anyhow::Result<Output> {
     let merged_dir = sandbox.dir.join("merged");
 
     // On macOS there are no namespaces. Run supported host tools
@@ -56,7 +90,8 @@ pub fn exec_sandbox(sandbox: &SandboxMetadata, cmd: &[String], env_vars: &[Strin
     let redirect_dir = if is_python {
         let dir = format!("{}/tmp/_sandbox_pathfix", merged_dir_str);
         let _ = std::fs::create_dir_all(&dir);
-        let sc = format!(r#"import os as _os, builtins as _bi
+        let sc = format!(
+            r#"import os as _os, builtins as _bi
 _M = _os.environ.get('_SANDBOX_MERGED_DIR', '')
 if _M:
     _orig = _bi.open
@@ -76,7 +111,8 @@ if _M:
                 f = alt
         return _iorig(f, *a, **k)
     _io.open = _rioopen
-"#);
+"#
+        );
         let _ = std::fs::write(format!("{}/sitecustomize.py", dir), sc);
         Some(dir)
     } else {
@@ -86,17 +122,42 @@ if _M:
     let mut command = Command::new(&effective_cmd);
     // Use the process's actual PATH (which includes e.g. conda) so
     // the same python3 that pip used during build is available here.
-    let host_path = std::env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin".to_string());
-    command.args(&translated_args)
+    let host_path = std::env::var("PATH")
+        .unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin".to_string());
+    command
+        .args(&translated_args)
         .current_dir(&merged_dir)
         // Host paths FIRST so native macOS binaries (python3, node, etc.)
         // are resolved before the Linux ELF binaries inside the image.
-        .env("PATH", format!("{}:{}/usr/local/sbin:{}/usr/local/bin:{}/usr/sbin:{}/usr/bin:{}/sbin:{}/bin",
-            host_path, merged_dir_str, merged_dir_str, merged_dir_str, merged_dir_str, merged_dir_str, merged_dir_str))
+        .env(
+            "PATH",
+            format!(
+                "{}:{}/usr/local/sbin:{}/usr/local/bin:{}/usr/sbin:{}/usr/bin:{}/sbin:{}/bin",
+                host_path,
+                merged_dir_str,
+                merged_dir_str,
+                merged_dir_str,
+                merged_dir_str,
+                merged_dir_str,
+                merged_dir_str
+            ),
+        )
         .env("HOME", format!("{}/root", merged_dir_str))
         .env("TMPDIR", format!("{}/tmp", merged_dir_str))
-        .env("NODE_PATH", format!("{0}/usr/local/lib/node_modules:{0}/home/daytona/workspace/node_modules", merged_dir_str))
-        .env("PUPPETEER_CACHE_DIR", format!("{}/.cache/puppeteer", std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string())))
+        .env(
+            "NODE_PATH",
+            format!(
+                "{0}/usr/local/lib/node_modules:{0}/home/daytona/workspace/node_modules",
+                merged_dir_str
+            ),
+        )
+        .env(
+            "PUPPETEER_CACHE_DIR",
+            format!(
+                "{}/.cache/puppeteer",
+                std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string())
+            ),
+        )
         .env("TERM", "xterm");
 
     for entry in env_vars {
@@ -190,7 +251,8 @@ if _M:
     };
 
     let mut command = tokio::process::Command::new(&effective_cmd);
-    let host_path = std::env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin".to_string());
+    let host_path = std::env::var("PATH")
+        .unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin".to_string());
     command
         .args(&translated_args)
         .current_dir(&merged_dir)
@@ -198,7 +260,13 @@ if _M:
             "PATH",
             format!(
                 "{}:{}/usr/local/sbin:{}/usr/local/bin:{}/usr/sbin:{}/usr/bin:{}/sbin:{}/bin",
-                host_path, merged_dir_str, merged_dir_str, merged_dir_str, merged_dir_str, merged_dir_str, merged_dir_str
+                host_path,
+                merged_dir_str,
+                merged_dir_str,
+                merged_dir_str,
+                merged_dir_str,
+                merged_dir_str,
+                merged_dir_str
             ),
         )
         .env("HOME", format!("{}/root", merged_dir_str))
@@ -212,7 +280,10 @@ if _M:
         )
         .env(
             "PUPPETEER_CACHE_DIR",
-            format!("{}/.cache/puppeteer", std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string())),
+            format!(
+                "{}/.cache/puppeteer",
+                std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string())
+            ),
         )
         .env("TERM", "xterm")
         .stdout(std::process::Stdio::piped())
@@ -275,14 +346,20 @@ fn detect_cpython_version_from_so(merged_dir: &Path) -> Option<String> {
             let sp = entry.path().join("site-packages");
             // Search up to 3 levels deep (e.g. numpy/_core/_multiarray_umath.cpython-312-darwin.so)
             for d1 in std::fs::read_dir(&sp).ok()?.filter_map(|e| e.ok()) {
-                if !d1.path().is_dir() { continue; }
+                if !d1.path().is_dir() {
+                    continue;
+                }
                 for d2 in std::fs::read_dir(d1.path()).ok()?.filter_map(|e| e.ok()) {
                     let fname = d2.file_name().to_string_lossy().to_string();
-                    if let Some(v) = extract_cpython_ver(&fname) { return Some(v); }
+                    if let Some(v) = extract_cpython_ver(&fname) {
+                        return Some(v);
+                    }
                     if d2.path().is_dir() {
                         for d3 in std::fs::read_dir(d2.path()).ok()?.filter_map(|e| e.ok()) {
                             let fname = d3.file_name().to_string_lossy().to_string();
-                            if let Some(v) = extract_cpython_ver(&fname) { return Some(v); }
+                            if let Some(v) = extract_cpython_ver(&fname) {
+                                return Some(v);
+                            }
                         }
                     }
                 }
@@ -305,25 +382,25 @@ fn resolve_macos_command(merged_dir: &Path, command: &str) -> String {
             // (e.g. .cpython-312-darwin.so). We must exec with that same version.
             if let Some(ver) = detect_cpython_version_from_so(merged_dir) {
                 let versioned = format!("python{}", ver);
-                if let Ok(output) = Command::new("which")
-                    .arg(&versioned)
-                    .output()
-                {
+                if let Ok(output) = Command::new("which").arg(&versioned).output() {
                     let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
                     if !path.is_empty() && Path::new(&path).exists() {
-                        info!("[macOS] Resolved {} → {} (matching cpython-{} C-extensions)", file_name, path, ver);
+                        info!(
+                            "[macOS] Resolved {} → {} (matching cpython-{} C-extensions)",
+                            file_name, path, ver
+                        );
                         return path;
                     }
                 }
             }
             "python3".to_string()
-        },
+        }
         "pip" | "pip3" => "pip3".to_string(),
         "node" | "npm" | "npx" => file_name.to_string(),
         "bash" | "sh" | "env" => file_name.to_string(),
-        "ls" | "cat" | "grep" | "head" | "tail" | "wc" | "sort" | "uniq"
-        | "find" | "mkdir" | "rm" | "cp" | "mv" | "touch" | "chmod"
-        | "echo" | "printf" | "tee" | "sed" | "awk" | "curl" | "wget" => file_name.to_string(),
+        "ls" | "cat" | "grep" | "head" | "tail" | "wc" | "sort" | "uniq" | "find" | "mkdir"
+        | "rm" | "cp" | "mv" | "touch" | "chmod" | "echo" | "printf" | "tee" | "sed" | "awk"
+        | "curl" | "wget" => file_name.to_string(),
         _ => translate_macos_path_arg(merged_dir, command),
     }
 }

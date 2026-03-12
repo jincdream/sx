@@ -38,13 +38,22 @@ pub fn compute_context_hash(context_dir: &Path) -> Result<String> {
 
 pub fn compute_build_cache_key(dockerfile_md5: &str, context_hash: &str) -> String {
     if let Some(ext) = crate::os::sys::get_cache_key_ext() {
-        format!("{:x}", md5::compute(format!("{}:{}:{}", dockerfile_md5, context_hash, ext)))
+        format!(
+            "{:x}",
+            md5::compute(format!("{}:{}:{}", dockerfile_md5, context_hash, ext))
+        )
     } else {
-        format!("{:x}", md5::compute(format!("{}:{}", dockerfile_md5, context_hash)))
+        format!(
+            "{:x}",
+            md5::compute(format!("{}:{}", dockerfile_md5, context_hash))
+        )
     }
 }
 
-pub fn resolve_cached_build_artifact(dockerfile_path: &Path, context_dir: &Path) -> Result<Option<BuildArtifact>> {
+pub fn resolve_cached_build_artifact(
+    dockerfile_path: &Path,
+    context_dir: &Path,
+) -> Result<Option<BuildArtifact>> {
     let dockerfile_md5 = compute_dockerfile_md5(dockerfile_path)?;
     let context_hash = compute_context_hash(context_dir)?;
     let cache_key = compute_build_cache_key(&dockerfile_md5, &context_hash);
@@ -57,9 +66,7 @@ pub fn resolve_cached_build_artifact(dockerfile_path: &Path, context_dir: &Path)
 
     info!(
         "Using global build artifact cache for key={} dockerfile_md5={} at {:?}",
-        cache_key,
-        dockerfile_md5,
-        snapshot_path
+        cache_key, dockerfile_md5, snapshot_path
     );
     persist_build_artifact_metadata(
         cache_key.clone(),
@@ -129,7 +136,8 @@ pub fn publish_build_artifact(
 }
 
 pub fn list_build_artifacts() -> Result<Vec<BuildArtifactMetadata>> {
-    let mut artifacts: Vec<BuildArtifactMetadata> = load_metadata()?.build_artifacts.into_values().collect();
+    let mut artifacts: Vec<BuildArtifactMetadata> =
+        load_metadata()?.build_artifacts.into_values().collect();
     artifacts.sort_by(|left, right| left.cache_key.cmp(&right.cache_key));
     Ok(artifacts)
 }
@@ -236,7 +244,11 @@ fn hash_directory(root: &Path, dir: &Path, hasher: &mut Sha256) -> Result<()> {
     Ok(())
 }
 
-fn matches_scope(cache_key: &str, artifact: &BuildArtifactMetadata, scope: &BuildCacheScope) -> bool {
+fn matches_scope(
+    cache_key: &str,
+    artifact: &BuildArtifactMetadata,
+    scope: &BuildCacheScope,
+) -> bool {
     match scope {
         BuildCacheScope::DockerfileMd5(value) => artifact.dockerfile_md5 == *value,
         BuildCacheScope::CacheKey(value) => cache_key == value,

@@ -1,25 +1,27 @@
-use axum::{
-    extract::{Path, Query, State, DefaultBodyLimit},
-    routing::{get, post, delete},
-    Json, Router,
-};
-use chrono::Utc;
-use serde::{Deserialize, Serialize};
-use std::net::SocketAddr;
-use std::path::PathBuf;
-use tracing::{info, error};
-use std::sync::Arc;
-use axum::response::sse::{Event, Sse};
-use axum::response::IntoResponse;
-use std::convert::Infallible;
-use futures_util::stream::Stream;
 use crate::build::build;
-use crate::build::cache::{list_build_artifacts, prune_build_artifacts, BuildCachePruneMode, BuildCacheScope};
+use crate::build::cache::{
+    list_build_artifacts, prune_build_artifacts, BuildCachePruneMode, BuildCacheScope,
+};
 use crate::build::parser::{parse_dockerfile, Instruction};
 use crate::metadata::{load_metadata, register_snapshot, save_metadata, SandboxMetadata};
 use crate::overlay::OverlayMount;
 use crate::sandbox::{run_sandbox, ResourceLimits, SandboxProfile};
 use crate::snapshot::{create_archive, get_sandboxes_dir};
+use axum::response::sse::{Event, Sse};
+use axum::response::IntoResponse;
+use axum::{
+    extract::{DefaultBodyLimit, Path, Query, State},
+    routing::{delete, get, post},
+    Json, Router,
+};
+use chrono::Utc;
+use futures_util::stream::Stream;
+use serde::{Deserialize, Serialize};
+use std::convert::Infallible;
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::sync::Arc;
+use tracing::{error, info};
 use uuid::Uuid;
 
 #[derive(Clone)]
@@ -90,6 +92,10 @@ pub struct ExecResponse {
     stdout: String,
     stderr: String,
     exit_code: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    signal: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    oom_killed: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -97,6 +103,21 @@ pub struct ServerInfoResponse {
     pub os: &'static str,
     pub degraded_mode: bool,
     pub supports_image_exec: bool,
+}
+
+#[derive(Serialize, Default, Clone)]
+pub struct SandboxRuntimeStatsResponse {
+    pub memory_current_bytes: Option<u64>,
+    pub memory_peak_bytes: Option<u64>,
+    pub process_resident_bytes: Option<u64>,
+    pub cpu_usage_usec: Option<u64>,
+    pub cpu_percent: Option<f64>,
+    pub pids_current: Option<u64>,
+    pub memory_limit_bytes: Option<u64>,
+    pub cpu_quota: Option<u64>,
+    pub cpu_period: Option<u64>,
+    pub pids_limit: Option<u64>,
+    pub oom_kill_count: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -179,10 +200,10 @@ pub async fn run_server() -> anyhow::Result<()> {
 
     let addr = SocketAddr::from(([0, 0, 0, 0], 3000));
     info!("Starting API server on {}", addr);
-    
+
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
-    
+
     Ok(())
 }
 
@@ -240,9 +261,7 @@ fn resolve_sandbox_path(
     let canon_root = std::fs::canonicalize(merged_dir)?;
 
     if !canonical.starts_with(&canon_root) {
-        anyhow::bail!(
-            "Resolved path escapes sandbox root (possible symlink attack)"
-        );
+        anyhow::bail!("Resolved path escapes sandbox root (possible symlink attack)");
     }
 
     // 4. If the path already exists and is a symlink, verify its target
@@ -256,9 +275,7 @@ fn resolve_sandbox_path(
                 std::fs::canonicalize(&link_target)?
             };
             if !abs_target.starts_with(&canon_root) {
-                anyhow::bail!(
-                    "Symlink target escapes sandbox root"
-                );
+                anyhow::bail!("Symlink target escapes sandbox root");
             }
         }
     }
@@ -280,8 +297,11 @@ async fn handle_build(
     State(_state): State<Arc<AppState>>,
     Json(payload): Json<BuildRequest>,
 ) -> Json<ApiResponse<BuildResponse>> {
-    info!("API Build requested: {} context: {}", payload.dockerfile, payload.context);
-    
+    info!(
+        "API Build requested: {} context: {}",
+        payload.dockerfile, payload.context
+    );
+
     let result: anyhow::Result<BuildResponse> = tokio::task::spawn_blocking(move || {
         let dockerfile_path = PathBuf::from(payload.dockerfile);
         let context_path = PathBuf::from(payload.context);
@@ -291,18 +311,29 @@ async fn handle_build(
         let (entrypoint, cmd, env) = extract_snapshot_config(&dockerfile_path)?;
 
         let mut metadata = load_metadata()?;
-        let snapshot_id = register_snapshot(&mut metadata, snapshot_path.clone(), entrypoint, cmd, env);
+        let snapshot_id =
+            register_snapshot(&mut metadata, snapshot_path.clone(), entrypoint, cmd, env);
         save_metadata(&metadata)?;
 
         Ok(BuildResponse {
             snapshot_path: snapshot_path.to_string_lossy().to_string(),
             snapshot_id,
         })
-    }).await.unwrap_or_else(|e| Err(anyhow::anyhow!("Task panic: {}", e)));
+    })
+    .await
+    .unwrap_or_else(|e| Err(anyhow::anyhow!("Task panic: {}", e)));
 
     match result {
-        Ok(data) => Json(ApiResponse { success: true, data: Some(data), error: None }),
-        Err(e) => Json(ApiResponse { success: false, data: None, error: Some(e.to_string()) }),
+        Ok(data) => Json(ApiResponse {
+            success: true,
+            data: Some(data),
+            error: None,
+        }),
+        Err(e) => Json(ApiResponse {
+            success: false,
+            data: None,
+            error: Some(e.to_string()),
+        }),
     }
 }
 
@@ -320,11 +351,21 @@ async fn handle_build_cache_list() -> Json<ApiResponse<Vec<BuildCacheEntryRespon
             })
             .collect();
         Ok::<_, anyhow::Error>(entries)
-    }).await.unwrap_or_else(|e| Err(anyhow::anyhow!("Task panic: {}", e)));
+    })
+    .await
+    .unwrap_or_else(|e| Err(anyhow::anyhow!("Task panic: {}", e)));
 
     match result {
-        Ok(data) => Json(ApiResponse { success: true, data: Some(data), error: None }),
-        Err(e) => Json(ApiResponse { success: false, data: None, error: Some(e.to_string()) }),
+        Ok(data) => Json(ApiResponse {
+            success: true,
+            data: Some(data),
+            error: None,
+        }),
+        Err(e) => Json(ApiResponse {
+            success: false,
+            data: None,
+            error: Some(e.to_string()),
+        }),
     }
 }
 
@@ -354,11 +395,21 @@ async fn handle_build_cache_prune(
             })
             .collect();
         Ok::<_, anyhow::Error>(entries)
-    }).await.unwrap_or_else(|e| Err(anyhow::anyhow!("Task panic: {}", e)));
+    })
+    .await
+    .unwrap_or_else(|e| Err(anyhow::anyhow!("Task panic: {}", e)));
 
     match result {
-        Ok(data) => Json(ApiResponse { success: true, data: Some(data), error: None }),
-        Err(e) => Json(ApiResponse { success: false, data: None, error: Some(e.to_string()) }),
+        Ok(data) => Json(ApiResponse {
+            success: true,
+            data: Some(data),
+            error: None,
+        }),
+        Err(e) => Json(ApiResponse {
+            success: false,
+            data: None,
+            error: Some(e.to_string()),
+        }),
     }
 }
 
@@ -367,10 +418,10 @@ async fn handle_start(
     Json(payload): Json<StartRequest>,
 ) -> Json<ApiResponse<StartResponse>> {
     info!("API Start requested from snapshot: {}", payload.snapshot);
-    
+
     let result: anyhow::Result<StartResponse> = tokio::task::spawn_blocking(move || {
         let snapshot_path = PathBuf::from(payload.snapshot);
-        let resource_limits = payload.resources;
+        let resource_limits = payload.resources.unwrap_or_default();
         let sandbox_id = Uuid::new_v4().to_string();
         let sandbox_dir = get_sandboxes_dir()?.join(&sandbox_id);
 
@@ -382,54 +433,68 @@ async fn handle_start(
             .max_by(|left, right| left.created_at.cmp(&right.created_at))
             .map(|snapshot| snapshot.id.clone())
             .unwrap_or_default();
-        
+
         let upper_dir = sandbox_dir.join("upper");
         let work_dir = sandbox_dir.join("work");
         let merged_dir = sandbox_dir.join("merged");
-        
+
         std::fs::create_dir_all(&upper_dir)?;
-        
-        let overlay = OverlayMount::new(
-            vec![snapshot_path],
-            upper_dir,
-            work_dir,
-            merged_dir.clone(),
-        )?;
+
+        let overlay =
+            OverlayMount::new(vec![snapshot_path], upper_dir, work_dir, merged_dir.clone())?;
         overlay.mount()?;
-        
+
         let mut metadata = load_metadata()?;
         metadata.sandboxes.insert(
             sandbox_id.clone(),
             SandboxMetadata {
                 id: sandbox_id.clone(),
-            snapshot_id,
+                snapshot_id,
                 created_at: Utc::now().to_rfc3339(),
                 dir: sandbox_dir.clone(),
                 pid: None,
                 ip: None,
+                resources: resource_limits.clone(),
             },
         );
         save_metadata(&metadata)?;
-        
+
         let local_sandbox_id = sandbox_id.clone();
-        
+
         // Spawn the blocking sandbox process in another thread so we can return the ID
         std::thread::spawn(move || {
             info!("Starting sandbox execution: {}", local_sandbox_id);
             // Use an infinite sleep so the primary container process doesn't exit immediately
             let sid = local_sandbox_id.clone();
-            if let Err(e) = run_sandbox(&sid, merged_dir.to_str().unwrap(), &["tail", "-f", "/dev/null"], resource_limits.as_ref(), None, SandboxProfile::Runtime) {
+            if let Err(e) = run_sandbox(
+                &sid,
+                merged_dir.to_str().unwrap(),
+                &["tail", "-f", "/dev/null"],
+                Some(&resource_limits),
+                None,
+                SandboxProfile::Runtime,
+            ) {
                 error!("Sandbox {} failed: {}", local_sandbox_id, e);
             }
             // We do not unmount here, we leave it to handle_destroy so the user can interact via API.
         });
 
         Ok(StartResponse { sandbox_id })
-    }).await.unwrap_or_else(|e| Err(anyhow::anyhow!("Task panic: {}", e)));
+    })
+    .await
+    .unwrap_or_else(|e| Err(anyhow::anyhow!("Task panic: {}", e)));
 
     match result {
-        Ok(data) => Json(ApiResponse { success: true, data: Some(data), error: None }),
-        Err(e) => Json(ApiResponse { success: false, data: None, error: Some(e.to_string()) }),
+        Ok(data) => Json(ApiResponse {
+            success: true,
+            data: Some(data),
+            error: None,
+        }),
+        Err(e) => Json(ApiResponse {
+            success: false,
+            data: None,
+            error: Some(e.to_string()),
+        }),
     }
 }
 
@@ -446,11 +511,21 @@ async fn handle_list() -> Json<ApiResponse<ListResponse>> {
             snapshots: metadata.snapshots.into_values().collect(),
             sandboxes: metadata.sandboxes.into_values().collect(),
         })
-    }).await.unwrap_or_else(|e| Err(anyhow::anyhow!("Task panic: {}", e)));
+    })
+    .await
+    .unwrap_or_else(|e| Err(anyhow::anyhow!("Task panic: {}", e)));
 
     match result {
-        Ok(data) => Json(ApiResponse { success: true, data: Some(data), error: None }),
-        Err(e) => Json(ApiResponse { success: false, data: None, error: Some(e.to_string()) }),
+        Ok(data) => Json(ApiResponse {
+            success: true,
+            data: Some(data),
+            error: None,
+        }),
+        Err(e) => Json(ApiResponse {
+            success: false,
+            data: None,
+            error: Some(e.to_string()),
+        }),
     }
 }
 
@@ -468,17 +543,25 @@ async fn handle_snapshot(
         } else {
             anyhow::bail!("Sandbox {} not found", payload.sandbox_id);
         }
-    }).await.unwrap_or_else(|e| Err(anyhow::anyhow!("Task panic: {}", e)));
+    })
+    .await
+    .unwrap_or_else(|e| Err(anyhow::anyhow!("Task panic: {}", e)));
 
     match result {
-        Ok(data) => Json(ApiResponse { success: true, data: Some(data), error: None }),
-        Err(e) => Json(ApiResponse { success: false, data: None, error: Some(e.to_string()) }),
+        Ok(data) => Json(ApiResponse {
+            success: true,
+            data: Some(data),
+            error: None,
+        }),
+        Err(e) => Json(ApiResponse {
+            success: false,
+            data: None,
+            error: Some(e.to_string()),
+        }),
     }
 }
 
-async fn handle_destroy(
-    Path(id): Path<String>,
-) -> Json<ApiResponse<String>> {
+async fn handle_destroy(Path(id): Path<String>) -> Json<ApiResponse<String>> {
     let result = tokio::task::spawn_blocking(move || {
         let mut metadata = load_metadata()?;
         if let Some(sandbox) = metadata.sandboxes.remove(&id) {
@@ -492,11 +575,21 @@ async fn handle_destroy(
         } else {
             anyhow::bail!("Sandbox {} not found", id);
         }
-    }).await.unwrap_or_else(|e| Err(anyhow::anyhow!("Task panic: {}", e)));
+    })
+    .await
+    .unwrap_or_else(|e| Err(anyhow::anyhow!("Task panic: {}", e)));
 
     match result {
-        Ok(data) => Json(ApiResponse { success: true, data: Some(data), error: None }),
-        Err(e) => Json(ApiResponse { success: false, data: None, error: Some(e.to_string()) }),
+        Ok(data) => Json(ApiResponse {
+            success: true,
+            data: Some(data),
+            error: None,
+        }),
+        Err(e) => Json(ApiResponse {
+            success: false,
+            data: None,
+            error: Some(e.to_string()),
+        }),
     }
 }
 
@@ -504,33 +597,45 @@ async fn handle_destroy(
 pub struct SandboxInfoResponse {
     pub id: String,
     pub ip: Option<String>,
+    pub pid: Option<i32>,
+    pub resources: ResourceLimits,
+    pub stats: SandboxRuntimeStatsResponse,
 }
 
-async fn handle_sandbox_info(
-    Path(id): Path<String>,
-) -> Json<ApiResponse<SandboxInfoResponse>> {
+async fn handle_sandbox_info(Path(id): Path<String>) -> Json<ApiResponse<SandboxInfoResponse>> {
     let result = tokio::task::spawn_blocking(move || {
         let metadata = load_metadata()?;
         if let Some(sandbox) = metadata.sandboxes.get(&id) {
+            let stats = crate::os::sys::get_sandbox_metrics(sandbox);
             Ok(SandboxInfoResponse {
                 id: sandbox.id.clone(),
                 ip: sandbox.ip.clone(),
+                pid: sandbox.pid,
+                resources: sandbox.resources.clone(),
+                stats,
             })
         } else {
             anyhow::bail!("Sandbox {} not found", id);
         }
-    }).await.unwrap_or_else(|e| Err(anyhow::anyhow!("Task panic: {}", e)));
+    })
+    .await
+    .unwrap_or_else(|e| Err(anyhow::anyhow!("Task panic: {}", e)));
 
     match result {
-        Ok(data) => Json(ApiResponse { success: true, data: Some(data), error: None }),
-        Err(e) => Json(ApiResponse { success: false, data: None, error: Some(e.to_string()) }),
+        Ok(data) => Json(ApiResponse {
+            success: true,
+            data: Some(data),
+            error: None,
+        }),
+        Err(e) => Json(ApiResponse {
+            success: false,
+            data: None,
+            error: Some(e.to_string()),
+        }),
     }
 }
 
-async fn handle_exec(
-    Path(id): Path<String>,
-    Json(payload): Json<ExecRequest>,
-) -> ExecApiResult {
+async fn handle_exec(Path(id): Path<String>, Json(payload): Json<ExecRequest>) -> ExecApiResult {
     if payload.cmd.is_empty() {
         return ExecApiResult::Json(Json(ApiResponse {
             success: false,
@@ -539,23 +644,29 @@ async fn handle_exec(
         }));
     }
 
-    let metadata_res = tokio::task::spawn_blocking(|| load_metadata()).await.unwrap_or_else(|_| Err(anyhow::anyhow!("tokio spawn blocking failed")));
+    let metadata_res = tokio::task::spawn_blocking(|| load_metadata())
+        .await
+        .unwrap_or_else(|_| Err(anyhow::anyhow!("tokio spawn blocking failed")));
     let metadata = match metadata_res {
         Ok(m) => m,
-        Err(e) => return ExecApiResult::Json(Json(ApiResponse {
-            success: false,
-            data: None,
-            error: Some(e.to_string()),
-        })),
+        Err(e) => {
+            return ExecApiResult::Json(Json(ApiResponse {
+                success: false,
+                data: None,
+                error: Some(e.to_string()),
+            }))
+        }
     };
 
     let sandbox = match metadata.sandboxes.get(&id) {
         Some(s) => s.clone(),
-        None => return ExecApiResult::Json(Json(ApiResponse {
-            success: false,
-            data: None,
-            error: Some(format!("Sandbox {} not found", id)),
-        })),
+        None => {
+            return ExecApiResult::Json(Json(ApiResponse {
+                success: false,
+                data: None,
+                error: Some(format!("Sandbox {} not found", id)),
+            }))
+        }
     };
 
     let snapshot_env = metadata
@@ -572,9 +683,9 @@ async fn handle_exec(
                 let stderr = child.stderr.take().expect("stderr should be piped");
 
                 use tokio::io::{AsyncReadExt, BufReader};
-                
+
                 let (tx, rx) = tokio::sync::mpsc::channel(100);
-                
+
                 let tx_out = tx.clone();
                 tokio::spawn(async move {
                     let mut reader = BufReader::new(stdout);
@@ -584,7 +695,11 @@ async fn handle_exec(
                             Ok(0) => break,
                             Ok(n) => {
                                 let content = String::from_utf8_lossy(&buf[..n]).to_string();
-                                if tx_out.send(Ok(Event::default().event("stdout").data(content))).await.is_err() {
+                                if tx_out
+                                    .send(Ok(Event::default().event("stdout").data(content)))
+                                    .await
+                                    .is_err()
+                                {
                                     break;
                                 }
                             }
@@ -602,7 +717,11 @@ async fn handle_exec(
                             Ok(0) => break,
                             Ok(n) => {
                                 let content = String::from_utf8_lossy(&buf[..n]).to_string();
-                                if tx_err.send(Ok(Event::default().event("stderr").data(content))).await.is_err() {
+                                if tx_err
+                                    .send(Ok(Event::default().event("stderr").data(content)))
+                                    .await
+                                    .is_err()
+                                {
                                     break;
                                 }
                             }
@@ -616,16 +735,21 @@ async fn handle_exec(
                     match child.wait().await {
                         Ok(status) => {
                             let code = status.code().unwrap_or(-1i32);
-                            let _ = tx_exit.send(Ok(Event::default().event("exit").data(code.to_string()))).await;
+                            let _ = tx_exit
+                                .send(Ok(Event::default().event("exit").data(code.to_string())))
+                                .await;
                         }
                         Err(_) => {
-                            let _ = tx_exit.send(Ok(Event::default().event("exit").data("-1"))).await;
+                            let _ = tx_exit
+                                .send(Ok(Event::default().event("exit").data("-1")))
+                                .await;
                         }
                     }
                 });
 
                 let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
-                ExecApiResult::Sse(Sse::new(Box::pin(stream) as std::pin::Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>))
+                ExecApiResult::Sse(Sse::new(Box::pin(stream)
+                    as std::pin::Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>))
             }
             Err(e) => {
                 let err_msg = e.to_string();
@@ -639,25 +763,85 @@ async fn handle_exec(
     } else {
         // Synchronous / JSON blocking execution
         let result = tokio::task::spawn_blocking(move || {
+            let oom_before = crate::os::sys::read_oom_kill_count(&sandbox.id);
             let output = crate::os::sys::exec_sandbox(&sandbox, &payload.cmd, &snapshot_env)?;
-            
+
+            let exit_code = output.status.code();
+            let signal = if exit_code.is_none() {
+                // Process was killed by a signal
+                #[cfg(unix)]
+                {
+                    use std::os::unix::process::ExitStatusExt;
+                    output.status.signal().map(|s| signal_name(s))
+                }
+                #[cfg(not(unix))]
+                { None }
+            } else {
+                None
+            };
+
+            let oom_killed = if signal.as_deref() == Some("SIGKILL") {
+                let oom_after = crate::os::sys::read_oom_kill_count(&sandbox.id);
+                match (oom_before, oom_after) {
+                    (Some(before), Some(after)) => Some(after > before),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+
+            let mut stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            if oom_killed == Some(true) {
+                stderr.push_str("\n[mini-daytona] Process was OOM-killed: memory usage exceeded the sandbox limit.");
+            }
+
             Ok(ExecResponse {
                 stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-                stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-                exit_code: output.status.code().unwrap_or(-1i32),
+                stderr,
+                exit_code: exit_code.unwrap_or(-1i32),
+                signal,
+                oom_killed,
             })
-        }).await.unwrap_or_else(|e| Err(anyhow::anyhow!("Task panic: {}", e)));
+        })
+        .await
+        .unwrap_or_else(|e| Err(anyhow::anyhow!("Task panic: {}", e)));
 
         match result {
-            Ok(data) => ExecApiResult::Json(Json(ApiResponse { success: true, data: Some(data), error: None })),
-            Err(e) => ExecApiResult::Json(Json(ApiResponse::<ExecResponse> { success: false, data: None, error: Some(e.to_string()) })),
+            Ok(data) => ExecApiResult::Json(Json(ApiResponse {
+                success: true,
+                data: Some(data),
+                error: None,
+            })),
+            Err(e) => ExecApiResult::Json(Json(ApiResponse::<ExecResponse> {
+                success: false,
+                data: None,
+                error: Some(e.to_string()),
+            })),
         }
+    }
+}
+
+fn signal_name(sig: i32) -> String {
+    match sig {
+        1 => "SIGHUP".to_string(),
+        2 => "SIGINT".to_string(),
+        6 => "SIGABRT".to_string(),
+        9 => "SIGKILL".to_string(),
+        11 => "SIGSEGV".to_string(),
+        13 => "SIGPIPE".to_string(),
+        14 => "SIGALRM".to_string(),
+        15 => "SIGTERM".to_string(),
+        _ => format!("SIG{}", sig),
     }
 }
 
 fn extract_snapshot_config(
     dockerfile_path: &std::path::Path,
-) -> anyhow::Result<(Option<Vec<String>>, Option<Vec<String>>, Option<Vec<String>>)> {
+) -> anyhow::Result<(
+    Option<Vec<String>>,
+    Option<Vec<String>>,
+    Option<Vec<String>>,
+)> {
     let instructions = parse_dockerfile(dockerfile_path)?;
     let mut entrypoint = None;
     let mut cmd = None;
@@ -690,11 +874,21 @@ async fn handle_file_read(
         } else {
             anyhow::bail!("Sandbox {} not found", id);
         }
-    }).await.unwrap_or_else(|e| Err(anyhow::anyhow!("Task panic: {}", e)));
+    })
+    .await
+    .unwrap_or_else(|e| Err(anyhow::anyhow!("Task panic: {}", e)));
 
     match result {
-        Ok(data) => Json(ApiResponse { success: true, data: Some(data), error: None }),
-        Err(e) => Json(ApiResponse { success: false, data: None, error: Some(e.to_string()) }),
+        Ok(data) => Json(ApiResponse {
+            success: true,
+            data: Some(data),
+            error: None,
+        }),
+        Err(e) => Json(ApiResponse {
+            success: false,
+            data: None,
+            error: Some(e.to_string()),
+        }),
     }
 }
 
@@ -707,21 +901,31 @@ async fn handle_file_write(
         if let Some(sandbox) = metadata.sandboxes.get(&id) {
             let merged_dir = sandbox.dir.join("merged");
             let target = resolve_sandbox_path(&merged_dir, &payload.path)?;
-            
+
             if let Some(parent) = target.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            
+
             std::fs::write(&target, payload.content)?;
             Ok(format!("File {} written successfully", payload.path))
         } else {
             anyhow::bail!("Sandbox {} not found", id);
         }
-    }).await.unwrap_or_else(|e| Err(anyhow::anyhow!("Task panic: {}", e)));
+    })
+    .await
+    .unwrap_or_else(|e| Err(anyhow::anyhow!("Task panic: {}", e)));
 
     match result {
-        Ok(data) => Json(ApiResponse { success: true, data: Some(data), error: None }),
-        Err(e) => Json(ApiResponse { success: false, data: None, error: Some(e.to_string()) }),
+        Ok(data) => Json(ApiResponse {
+            success: true,
+            data: Some(data),
+            error: None,
+        }),
+        Err(e) => Json(ApiResponse {
+            success: false,
+            data: None,
+            error: Some(e.to_string()),
+        }),
     }
 }
 
@@ -734,22 +938,32 @@ async fn handle_file_delete(
         if let Some(sandbox) = metadata.sandboxes.get(&id) {
             let merged_dir = sandbox.dir.join("merged");
             let target = resolve_sandbox_path(&merged_dir, &payload.path)?;
-            
+
             if target.is_dir() {
                 std::fs::remove_dir_all(&target)?;
             } else {
                 std::fs::remove_file(&target)?;
             }
-            
+
             Ok(format!("File {} deleted successfully", payload.path))
         } else {
             anyhow::bail!("Sandbox {} not found", id);
         }
-    }).await.unwrap_or_else(|e| Err(anyhow::anyhow!("Task panic: {}", e)));
+    })
+    .await
+    .unwrap_or_else(|e| Err(anyhow::anyhow!("Task panic: {}", e)));
 
     match result {
-        Ok(data) => Json(ApiResponse { success: true, data: Some(data), error: None }),
-        Err(e) => Json(ApiResponse { success: false, data: None, error: Some(e.to_string()) }),
+        Ok(data) => Json(ApiResponse {
+            success: true,
+            data: Some(data),
+            error: None,
+        }),
+        Err(e) => Json(ApiResponse {
+            success: false,
+            data: None,
+            error: Some(e.to_string()),
+        }),
     }
 }
 
@@ -775,15 +989,29 @@ async fn handle_file_upload(
                 .map_err(|e| anyhow::anyhow!("Invalid base64 data: {}", e))?;
 
             std::fs::write(&target, &bytes)?;
-            Ok(format!("File {} uploaded successfully ({} bytes)", payload.path, bytes.len()))
+            Ok(format!(
+                "File {} uploaded successfully ({} bytes)",
+                payload.path,
+                bytes.len()
+            ))
         } else {
             anyhow::bail!("Sandbox {} not found", id);
         }
-    }).await.unwrap_or_else(|e| Err(anyhow::anyhow!("Task panic: {}", e)));
+    })
+    .await
+    .unwrap_or_else(|e| Err(anyhow::anyhow!("Task panic: {}", e)));
 
     match result {
-        Ok(data) => Json(ApiResponse { success: true, data: Some(data), error: None }),
-        Err(e) => Json(ApiResponse { success: false, data: None, error: Some(e.to_string()) }),
+        Ok(data) => Json(ApiResponse {
+            success: true,
+            data: Some(data),
+            error: None,
+        }),
+        Err(e) => Json(ApiResponse {
+            success: false,
+            data: None,
+            error: Some(e.to_string()),
+        }),
     }
 }
 
@@ -805,17 +1033,25 @@ async fn handle_file_download(
         } else {
             anyhow::bail!("Sandbox {} not found", id);
         }
-    }).await.unwrap_or_else(|e| Err(anyhow::anyhow!("Task panic: {}", e)));
+    })
+    .await
+    .unwrap_or_else(|e| Err(anyhow::anyhow!("Task panic: {}", e)));
 
     match result {
-        Ok(data) => Json(ApiResponse { success: true, data: Some(data), error: None }),
-        Err(e) => Json(ApiResponse { success: false, data: None, error: Some(e.to_string()) }),
+        Ok(data) => Json(ApiResponse {
+            success: true,
+            data: Some(data),
+            error: None,
+        }),
+        Err(e) => Json(ApiResponse {
+            success: false,
+            data: None,
+            error: Some(e.to_string()),
+        }),
     }
 }
 
-async fn handle_suspend(
-    Path(id): Path<String>,
-) -> Json<ApiResponse<String>> {
+async fn handle_suspend(Path(id): Path<String>) -> Json<ApiResponse<String>> {
     let result = tokio::task::spawn_blocking(move || {
         let metadata = load_metadata()?;
         if let Some(sandbox) = metadata.sandboxes.get(&id) {
@@ -825,17 +1061,25 @@ async fn handle_suspend(
         } else {
             anyhow::bail!("Sandbox {} not found", id);
         }
-    }).await.unwrap_or_else(|e| Err(anyhow::anyhow!("Task panic: {}", e)));
+    })
+    .await
+    .unwrap_or_else(|e| Err(anyhow::anyhow!("Task panic: {}", e)));
 
     match result {
-        Ok(data) => Json(ApiResponse { success: true, data: Some(data), error: None }),
-        Err(e) => Json(ApiResponse { success: false, data: None, error: Some(e.to_string()) }),
+        Ok(data) => Json(ApiResponse {
+            success: true,
+            data: Some(data),
+            error: None,
+        }),
+        Err(e) => Json(ApiResponse {
+            success: false,
+            data: None,
+            error: Some(e.to_string()),
+        }),
     }
 }
 
-async fn handle_resume(
-    Path(id): Path<String>,
-) -> Json<ApiResponse<String>> {
+async fn handle_resume(Path(id): Path<String>) -> Json<ApiResponse<String>> {
     let result = tokio::task::spawn_blocking(move || {
         let metadata = load_metadata()?;
         if let Some(sandbox) = metadata.sandboxes.get(&id) {
@@ -845,11 +1089,21 @@ async fn handle_resume(
         } else {
             anyhow::bail!("Sandbox {} not found", id);
         }
-    }).await.unwrap_or_else(|e| Err(anyhow::anyhow!("Task panic: {}", e)));
+    })
+    .await
+    .unwrap_or_else(|e| Err(anyhow::anyhow!("Task panic: {}", e)));
 
     match result {
-        Ok(data) => Json(ApiResponse { success: true, data: Some(data), error: None }),
-        Err(e) => Json(ApiResponse { success: false, data: None, error: Some(e.to_string()) }),
+        Ok(data) => Json(ApiResponse {
+            success: true,
+            data: Some(data),
+            error: None,
+        }),
+        Err(e) => Json(ApiResponse {
+            success: false,
+            data: None,
+            error: Some(e.to_string()),
+        }),
     }
 }
 
@@ -860,12 +1114,23 @@ async fn handle_sandbox_url(
     let metadata_res = tokio::task::spawn_blocking(|| load_metadata()).await;
     let metadata = match metadata_res {
         Ok(Ok(m)) => m,
-        _ => return Json(ApiResponse { success: false, data: None, error: Some("Failed to load metadata".into()) }),
+        _ => {
+            return Json(ApiResponse {
+                success: false,
+                data: None,
+                error: Some("Failed to load metadata".into()),
+            })
+        }
     };
     if !metadata.sandboxes.contains_key(&id) {
-        return Json(ApiResponse { success: false, data: None, error: Some(format!("Sandbox {} not found", id)) });
+        return Json(ApiResponse {
+            success: false,
+            data: None,
+            error: Some(format!("Sandbox {} not found", id)),
+        });
     }
-    let host = headers.get("host")
+    let host = headers
+        .get("host")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("localhost:3000");
     let url = format!("http://{}/api/sandbox/{}/proxy/{}", host, id, port);
@@ -876,9 +1141,7 @@ async fn handle_sandbox_url(
     })
 }
 
-async fn handle_proxy_root(
-    Path((id, port)): Path<(String, u16)>,
-) -> axum::response::Response {
+async fn handle_proxy_root(Path((id, port)): Path<(String, u16)>) -> axum::response::Response {
     proxy_to_sandbox(&id, port, "").await
 }
 
@@ -942,11 +1205,9 @@ async fn proxy_to_sandbox(id: &str, port: u16, path: &str) -> axum::response::Re
             let body_bytes = resp.bytes().await.unwrap_or_default();
             builder.body(axum::body::Body::from(body_bytes)).unwrap()
         }
-        Err(e) => {
-            axum::response::Response::builder()
-                .status(502)
-                .body(axum::body::Body::from(format!("Proxy error: {}", e)))
-                .unwrap()
-        }
+        Err(e) => axum::response::Response::builder()
+            .status(502)
+            .body(axum::body::Body::from(format!("Proxy error: {}", e)))
+            .unwrap(),
     }
 }

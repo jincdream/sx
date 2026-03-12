@@ -2,7 +2,12 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use tracing::info;
 
-pub fn mount_overlay(merged_dir: &Path, lower_dirs: &[PathBuf], upper_dir: &Path, _work_dir: &Path) -> anyhow::Result<()> {
+pub fn mount_overlay(
+    merged_dir: &Path,
+    lower_dirs: &[PathBuf],
+    upper_dir: &Path,
+    _work_dir: &Path,
+) -> anyhow::Result<()> {
     fs::create_dir_all(upper_dir)?;
     fs::create_dir_all(_work_dir)?;
     fs::create_dir_all(merged_dir)?;
@@ -20,9 +25,7 @@ pub fn mount_overlay(merged_dir: &Path, lower_dirs: &[PathBuf], upper_dir: &Path
 
     // Copy upper dir on top (highest priority, overrides lower layers)
     if upper_dir.exists() {
-        let entries: Vec<_> = fs::read_dir(upper_dir)?
-            .filter_map(|e| e.ok())
-            .collect();
+        let entries: Vec<_> = fs::read_dir(upper_dir)?.filter_map(|e| e.ok()).collect();
         if !entries.is_empty() {
             copy_dir_contents(upper_dir, merged_dir, "upper dir")?;
         }
@@ -36,7 +39,10 @@ pub fn mount_overlay(merged_dir: &Path, lower_dirs: &[PathBuf], upper_dir: &Path
 }
 
 pub fn unmount_overlay(merged_dir: &Path) -> anyhow::Result<()> {
-    info!("[macOS] Simulating overlay unmount for merged_dir {:?}", merged_dir);
+    info!(
+        "[macOS] Simulating overlay unmount for merged_dir {:?}",
+        merged_dir
+    );
     // Real code removes the active content so there is "nothing" mounted.
     // the parent cleanup will delete everything else anyway
     if merged_dir.exists() {
@@ -47,7 +53,7 @@ pub fn unmount_overlay(merged_dir: &Path) -> anyhow::Result<()> {
 
 fn copy_dir_contents(src: &Path, dst: &Path, label: &str) -> anyhow::Result<()> {
     let status = std::process::Command::new("rsync")
-        .arg("-a")           // archive mode (preserves symlinks, permissions, etc.)
+        .arg("-a") // archive mode (preserves symlinks, permissions, etc.)
         .arg("--chmod=u+rwX") // ensure owner can write, so later layers can overwrite
         .arg("--ignore-errors")
         .arg(format!("{}/", src.to_string_lossy())) // trailing slash = contents only
@@ -61,13 +67,19 @@ fn copy_dir_contents(src: &Path, dst: &Path, label: &str) -> anyhow::Result<()> 
             Ok(())
         }
         Err(_) => {
-            tracing::warn!("[macOS] rsync not found, falling back to cp -a for {} {:?}", label, src);
+            tracing::warn!(
+                "[macOS] rsync not found, falling back to cp -a for {} {:?}",
+                label,
+                src
+            );
             let status = std::process::Command::new("cp")
                 .arg("-a")
                 .arg(format!("{}/.", src.to_string_lossy()))
                 .arg(dst)
                 .status()
-                .map_err(|e| anyhow::anyhow!("Failed to execute cp -a for {} {:?}: {}", label, src, e))?;
+                .map_err(|e| {
+                    anyhow::anyhow!("Failed to execute cp -a for {} {:?}: {}", label, src, e)
+                })?;
 
             if !status.success() {
                 tracing::warn!("[macOS] cp -a had non-zero exit for {} {:?} (likely some special files/symlinks failed to copy)", label, src);
