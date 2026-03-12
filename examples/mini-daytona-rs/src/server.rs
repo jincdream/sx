@@ -9,9 +9,9 @@ use crate::metadata::{
 };
 use crate::overlay::OverlayMount;
 use crate::sandbox::{run_sandbox, BindMount, ResourceLimits, SandboxProfile};
-use crate::snapshot::{create_archive, get_sandboxes_dir};
+use crate::snapshot::{create_archive, get_sandboxes_dir, get_snapshots_dir, hardlink_copy};
 use axum::response::sse::{Event, Sse};
-use axum::response::IntoResponse;
+use axum::response::{Html, IntoResponse};
 use axum::{
     extract::{DefaultBodyLimit, Path, Query, State},
     routing::{delete, get, post},
@@ -22,10 +22,14 @@ use futures_util::stream::Stream;
 use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path as FsPath, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
 use tracing::{error, info};
 use uuid::Uuid;
+
+const ADMIN_HTML: &str = include_str!("../web/admin.html");
+const PROJECT_ROOT: &str = env!("CARGO_MANIFEST_DIR");
 
 #[derive(Clone)]
 pub struct AppState {}
@@ -189,18 +193,71 @@ pub struct VolumeResponse {
     created_at: String,
 }
 
+#[derive(Serialize)]
+pub struct ImageDefinitionResponse {
+    name: String,
+    dockerfile_path: String,
+    context_path: String,
+    dockerfile_content: String,
+}
+
+#[derive(Deserialize)]
+pub struct ImageDockerfileUpdateRequest {
+    content: String,
+}
+
+#[derive(Serialize)]
+pub struct SnapshotDeleteResponse {
+    id: String,
+    path: String,
+}
+
+#[derive(Deserialize)]
+pub struct SandboxSnapshotCreateRequest {
+    sandbox_id: String,
+}
+
+#[derive(Deserialize)]
+pub struct E2eRunRequest {
+    #[serde(default = "default_client_only")]
+    client_only: bool,
+    #[serde(default)]
+    test: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct E2eRunResponse {
+    command: Vec<String>,
+    exit_code: i32,
+    stdout: String,
+    stderr: String,
+    duration_ms: u64,
+}
+
+fn default_client_only() -> bool {
+    true
+}
+
 pub async fn run_server() -> anyhow::Result<()> {
     // Initialize the network bridge for sandbox isolation
     crate::netns::ensure_bridge()?;
 
     let app = Router::new()
+        .route("/", get(handle_admin_page))
+        .route("/admin", get(handle_admin_page))
         .route("/api/info", get(handle_info))
+        .route("/api/images", get(handle_image_list))
+        .route("/api/images/{name}/dockerfile", post(handle_image_dockerfile_update))
+        .route("/api/images/{name}/build", post(handle_image_build))
         .route("/api/build", post(handle_build))
         .route("/api/build-cache", get(handle_build_cache_list))
         .route("/api/build-cache/prune", post(handle_build_cache_prune))
         .route("/api/start", post(handle_start))
         .route("/api/snapshot", post(handle_snapshot))
+        .route("/api/snapshots/from-sandbox", post(handle_snapshot_create_from_sandbox))
+        .route("/api/snapshots/{id}", delete(handle_snapshot_delete))
         .route("/api/list", get(handle_list))
+        .route("/api/e2e", post(handle_run_e2e))
         .route("/api/sandbox/{id}", delete(handle_destroy))
         .route("/api/sandbox/{id}/info", get(handle_sandbox_info))
         .route("/api/sandbox/{id}/exec", post(handle_exec))
@@ -227,6 +284,48 @@ pub async fn run_server() -> anyhow::Result<()> {
     axum::serve(listener, app).await?;
 
     Ok(())
+}
+
+fn images_root_dir() -> PathBuf {
+    FsPath::new(PROJECT_ROOT).join("images")
+}
+
+fn resolve_image_dir(name: &str) -> anyhow::Result<PathBuf> {
+    if name.is_empty() || name.contains('/') || name.contains("..") {
+        anyhow::bail!("Invalid image name: {}", name);
+    }
+
+    let path = images_root_dir().join(name);
+    if !path.is_dir() {
+        anyhow::bail!("Image {} not found", name);
+    }
+
+    if !path.join("Dockerfile").is_file() {
+        anyhow::bail!("Image {} is missing Dockerfile", name);
+    }
+
+    Ok(path)
+}
+
+fn build_snapshot_from_paths(
+    dockerfile_path: PathBuf,
+    context_path: PathBuf,
+) -> anyhow::Result<BuildResponse> {
+    let snapshot_path = build(&dockerfile_path, &context_path)?;
+    let (entrypoint, cmd, env) = extract_snapshot_config(&dockerfile_path)?;
+
+    let mut metadata = load_metadata()?;
+    let snapshot_id = register_snapshot(&mut metadata, snapshot_path.clone(), entrypoint, cmd, env);
+    save_metadata(&metadata)?;
+
+    Ok(BuildResponse {
+        snapshot_path: snapshot_path.to_string_lossy().to_string(),
+        snapshot_id,
+    })
+}
+
+async fn handle_admin_page() -> Html<&'static str> {
+    Html(ADMIN_HTML)
 }
 
 /// Resolve a user-supplied relative path inside the sandbox merged directory.
@@ -362,6 +461,107 @@ async fn handle_info() -> Json<ApiResponse<ServerInfoResponse>> {
     })
 }
 
+async fn handle_image_list() -> Json<ApiResponse<Vec<ImageDefinitionResponse>>> {
+    let result = tokio::task::spawn_blocking(|| {
+        let mut images = Vec::new();
+
+        for entry in std::fs::read_dir(images_root_dir())? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+
+            let name = entry.file_name().to_string_lossy().to_string();
+            let dir = entry.path();
+            let dockerfile_path = dir.join("Dockerfile");
+            if !dockerfile_path.is_file() {
+                continue;
+            }
+
+            images.push(ImageDefinitionResponse {
+                name,
+                dockerfile_path: dockerfile_path.to_string_lossy().to_string(),
+                context_path: dir.to_string_lossy().to_string(),
+                dockerfile_content: std::fs::read_to_string(dockerfile_path)?,
+            });
+        }
+
+        images.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok::<_, anyhow::Error>(images)
+    })
+    .await
+    .unwrap_or_else(|e| Err(anyhow::anyhow!("Task panic: {}", e)));
+
+    match result {
+        Ok(data) => Json(ApiResponse {
+            success: true,
+            data: Some(data),
+            error: None,
+        }),
+        Err(e) => Json(ApiResponse {
+            success: false,
+            data: None,
+            error: Some(e.to_string()),
+        }),
+    }
+}
+
+async fn handle_image_dockerfile_update(
+    Path(name): Path<String>,
+    Json(payload): Json<ImageDockerfileUpdateRequest>,
+) -> Json<ApiResponse<ImageDefinitionResponse>> {
+    let result = tokio::task::spawn_blocking(move || {
+        let dir = resolve_image_dir(&name)?;
+        let dockerfile_path = dir.join("Dockerfile");
+        std::fs::write(&dockerfile_path, payload.content.clone())?;
+
+        Ok::<_, anyhow::Error>(ImageDefinitionResponse {
+            name,
+            dockerfile_path: dockerfile_path.to_string_lossy().to_string(),
+            context_path: dir.to_string_lossy().to_string(),
+            dockerfile_content: payload.content,
+        })
+    })
+    .await
+    .unwrap_or_else(|e| Err(anyhow::anyhow!("Task panic: {}", e)));
+
+    match result {
+        Ok(data) => Json(ApiResponse {
+            success: true,
+            data: Some(data),
+            error: None,
+        }),
+        Err(e) => Json(ApiResponse {
+            success: false,
+            data: None,
+            error: Some(e.to_string()),
+        }),
+    }
+}
+
+async fn handle_image_build(Path(name): Path<String>) -> Json<ApiResponse<BuildResponse>> {
+    let result = tokio::task::spawn_blocking(move || {
+        let dir = resolve_image_dir(&name)?;
+        let dockerfile_path = dir.join("Dockerfile");
+        build_snapshot_from_paths(dockerfile_path, dir)
+    })
+    .await
+    .unwrap_or_else(|e| Err(anyhow::anyhow!("Task panic: {}", e)));
+
+    match result {
+        Ok(data) => Json(ApiResponse {
+            success: true,
+            data: Some(data),
+            error: None,
+        }),
+        Err(e) => Json(ApiResponse {
+            success: false,
+            data: None,
+            error: Some(e.to_string()),
+        }),
+    }
+}
+
 async fn handle_build(
     State(_state): State<Arc<AppState>>,
     Json(payload): Json<BuildRequest>,
@@ -372,22 +572,7 @@ async fn handle_build(
     );
 
     let result: anyhow::Result<BuildResponse> = tokio::task::spawn_blocking(move || {
-        let dockerfile_path = PathBuf::from(payload.dockerfile);
-        let context_path = PathBuf::from(payload.context);
-
-        let snapshot_path = build(&dockerfile_path, &context_path)?;
-
-        let (entrypoint, cmd, env) = extract_snapshot_config(&dockerfile_path)?;
-
-        let mut metadata = load_metadata()?;
-        let snapshot_id =
-            register_snapshot(&mut metadata, snapshot_path.clone(), entrypoint, cmd, env);
-        save_metadata(&metadata)?;
-
-        Ok(BuildResponse {
-            snapshot_path: snapshot_path.to_string_lossy().to_string(),
-            snapshot_id,
-        })
+        build_snapshot_from_paths(PathBuf::from(payload.dockerfile), PathBuf::from(payload.context))
     })
     .await
     .unwrap_or_else(|e| Err(anyhow::anyhow!("Task panic: {}", e)));
@@ -635,10 +820,109 @@ async fn handle_snapshot(
             let merged_dir = sandbox.dir.join("merged");
             let output = PathBuf::from(&payload.output);
             create_archive(&merged_dir, &output)?;
+            let mut writable_metadata = load_metadata()?;
+            register_snapshot(&mut writable_metadata, output.clone(), None, None, None);
+            save_metadata(&writable_metadata)?;
             Ok(payload.output)
         } else {
             anyhow::bail!("Sandbox {} not found", payload.sandbox_id);
         }
+    })
+    .await
+    .unwrap_or_else(|e| Err(anyhow::anyhow!("Task panic: {}", e)));
+
+    match result {
+        Ok(data) => Json(ApiResponse {
+            success: true,
+            data: Some(data),
+            error: None,
+        }),
+        Err(e) => Json(ApiResponse {
+            success: false,
+            data: None,
+            error: Some(e.to_string()),
+        }),
+    }
+}
+
+async fn handle_snapshot_create_from_sandbox(
+    Json(payload): Json<SandboxSnapshotCreateRequest>,
+) -> Json<ApiResponse<BuildResponse>> {
+    let result = tokio::task::spawn_blocking(move || {
+        let metadata = load_metadata()?;
+        let sandbox = metadata
+            .sandboxes
+            .get(&payload.sandbox_id)
+            .ok_or_else(|| anyhow::anyhow!("Sandbox {} not found", payload.sandbox_id))?
+            .clone();
+
+        let snapshot_id = Uuid::new_v4().to_string();
+        let snapshot_path = get_snapshots_dir()?.join(&snapshot_id);
+        hardlink_copy(&sandbox.dir.join("merged"), &snapshot_path)?;
+
+        let mut writable_metadata = load_metadata()?;
+        writable_metadata.snapshots.insert(
+            snapshot_id.clone(),
+            crate::metadata::SnapshotMetadata {
+                id: snapshot_id.clone(),
+                path: snapshot_path.clone(),
+                created_at: Utc::now().to_rfc3339(),
+                entrypoint: None,
+                cmd: None,
+                env: None,
+            },
+        );
+        save_metadata(&writable_metadata)?;
+
+        Ok::<_, anyhow::Error>(BuildResponse {
+            snapshot_path: snapshot_path.to_string_lossy().to_string(),
+            snapshot_id,
+        })
+    })
+    .await
+    .unwrap_or_else(|e| Err(anyhow::anyhow!("Task panic: {}", e)));
+
+    match result {
+        Ok(data) => Json(ApiResponse {
+            success: true,
+            data: Some(data),
+            error: None,
+        }),
+        Err(e) => Json(ApiResponse {
+            success: false,
+            data: None,
+            error: Some(e.to_string()),
+        }),
+    }
+}
+
+async fn handle_snapshot_delete(Path(id): Path<String>) -> Json<ApiResponse<SnapshotDeleteResponse>> {
+    let result = tokio::task::spawn_blocking(move || {
+        let mut metadata = load_metadata()?;
+
+        if metadata.sandboxes.values().any(|sandbox| sandbox.snapshot_id == id) {
+            anyhow::bail!("Snapshot {} is in use by at least one sandbox", id);
+        }
+
+        let snapshot = metadata
+            .snapshots
+            .remove(&id)
+            .ok_or_else(|| anyhow::anyhow!("Snapshot {} not found", id))?;
+
+        if snapshot.path.exists() {
+            if snapshot.path.is_dir() {
+                std::fs::remove_dir_all(&snapshot.path)?;
+            } else {
+                std::fs::remove_file(&snapshot.path)?;
+            }
+        }
+
+        save_metadata(&metadata)?;
+
+        Ok::<_, anyhow::Error>(SnapshotDeleteResponse {
+            id,
+            path: snapshot.path.to_string_lossy().to_string(),
+        })
     })
     .await
     .unwrap_or_else(|e| Err(anyhow::anyhow!("Task panic: {}", e)));
@@ -1341,6 +1625,51 @@ async fn handle_volume_delete(Path(id): Path<String>) -> Json<ApiResponse<String
         } else {
             anyhow::bail!("Volume {} not found", id);
         }
+    })
+    .await
+    .unwrap_or_else(|e| Err(anyhow::anyhow!("Task panic: {}", e)));
+
+    match result {
+        Ok(data) => Json(ApiResponse {
+            success: true,
+            data: Some(data),
+            error: None,
+        }),
+        Err(e) => Json(ApiResponse {
+            success: false,
+            data: None,
+            error: Some(e.to_string()),
+        }),
+    }
+}
+
+async fn handle_run_e2e(Json(payload): Json<E2eRunRequest>) -> Json<ApiResponse<E2eRunResponse>> {
+    let result = tokio::task::spawn_blocking(move || {
+        let mut args = vec!["test/run_e2e.js".to_string()];
+        if payload.client_only {
+            args.push("--client".to_string());
+        }
+        if let Some(test) = payload.test.filter(|value| !value.trim().is_empty()) {
+            args.push(format!("--test={}", test.trim()));
+        }
+
+        let command_preview = std::iter::once("node".to_string())
+            .chain(args.iter().cloned())
+            .collect::<Vec<_>>();
+
+        let started_at = std::time::Instant::now();
+        let output = Command::new("node")
+            .args(&args)
+            .current_dir(PROJECT_ROOT)
+            .output()?;
+
+        Ok::<_, anyhow::Error>(E2eRunResponse {
+            command: command_preview,
+            exit_code: output.status.code().unwrap_or(-1),
+            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+            duration_ms: started_at.elapsed().as_millis() as u64,
+        })
     })
     .await
     .unwrap_or_else(|e| Err(anyhow::anyhow!("Task panic: {}", e)));

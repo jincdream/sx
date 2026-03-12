@@ -108,6 +108,12 @@ pub fn get_build_artifacts_dir() -> anyhow::Result<PathBuf> {
     Ok(dir)
 }
 
+pub fn get_snapshots_dir() -> anyhow::Result<PathBuf> {
+    let dir = get_data_dir()?.join("snapshots");
+    fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
 pub fn get_sandboxes_dir() -> anyhow::Result<PathBuf> {
     let dir = get_data_dir()?.join("sandboxes");
     fs::create_dir_all(&dir)?;
