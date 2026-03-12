@@ -146,6 +146,7 @@ fn main() -> Result<()> {
                     pid: None,
                     ip: None,
                     resources: sandbox::ResourceLimits::default(),
+                    mounts: vec![],
                 },
             );
             save_metadata(&metadata)?;
@@ -158,6 +159,7 @@ fn main() -> Result<()> {
                 None,
                 None,
                 sandbox::SandboxProfile::Runtime,
+                &[],
             ) {
                 error!("Sandbox {} failed: {}", sandbox_id, e);
             }

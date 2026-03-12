@@ -20,5 +20,6 @@ pub fn build_instruction(
         None,
         Some(workdir),
         SandboxProfile::Build,
+        &[],
     )
 }

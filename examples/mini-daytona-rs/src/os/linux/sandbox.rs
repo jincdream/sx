@@ -9,7 +9,7 @@ use std::fs;
 use tracing::{error, info, warn};
 
 use crate::os::sys::netns;
-use crate::sandbox::{ResourceLimits, SandboxProfile};
+use crate::sandbox::{BindMount, ResourceLimits, SandboxProfile};
 
 const STACK_SIZE: usize = 1024 * 1024;
 
@@ -20,6 +20,7 @@ pub fn run_sandbox(
     limits: Option<&ResourceLimits>,
     workdir: Option<&str>,
     profile: SandboxProfile,
+    bind_mounts: &[BindMount],
 ) -> anyhow::Result<()> {
     let mut stack = vec![0u8; STACK_SIZE];
 
@@ -33,6 +34,7 @@ pub fn run_sandbox(
     let merged_dir_c = CString::new(merged_dir)?;
     let cmd_c: Vec<CString> = cmd.iter().map(|s| CString::new(*s).unwrap()).collect();
     let workdir_c = workdir.map(|w| CString::new(w).unwrap());
+    let bind_mounts_owned: Vec<BindMount> = bind_mounts.to_vec();
 
     // Create a pipe for parent→child signaling.
     // Child blocks on read_fd until parent finishes user-ns + network setup, then writes a byte.
@@ -59,6 +61,7 @@ pub fn run_sandbox(
                     &cmd_c,
                     workdir_c.as_deref(),
                     profile,
+                    &bind_mounts_owned,
                 ) {
                     eprintln!("Child error: {}", e);
                     std::process::exit(1);
@@ -250,6 +253,7 @@ fn child(
     cmd: &[CString],
     workdir: Option<&std::ffi::CStr>,
     profile: SandboxProfile,
+    bind_mounts: &[BindMount],
 ) -> anyhow::Result<()> {
     sethostname("mini-daytona")?;
 
@@ -278,6 +282,40 @@ fn child(
 
     // Setup /dev with essential device nodes by bind-mounting from host
     setup_dev(new_root)?;
+
+    // Bind-mount shared volumes into the new root BEFORE pivot_root
+    for bm in bind_mounts {
+        let target = format!("{}{}", new_root, bm.container_path);
+        fs::create_dir_all(&target)?;
+        mount(
+            Some(bm.host_path.to_str().unwrap_or_default()),
+            target.as_str(),
+            None::<&str>,
+            MsFlags::MS_BIND | MsFlags::MS_REC,
+            None::<&str>,
+        )
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "bind mount volume {} -> {} failed: {}",
+                bm.host_path.display(),
+                target,
+                e
+            )
+        })?;
+        if bm.readonly {
+            mount(
+                Some(target.as_str()),
+                target.as_str(),
+                None::<&str>,
+                MsFlags::MS_BIND | MsFlags::MS_REMOUNT | MsFlags::MS_RDONLY | MsFlags::MS_REC,
+                None::<&str>,
+            )
+            .map_err(|e| {
+                anyhow::anyhow!("remount readonly {} failed: {}", target, e)
+            })?;
+        }
+        info!("Volume mounted: {} -> {}", bm.host_path.display(), bm.container_path);
+    }
 
     // Bind-mount host /proc into new root BEFORE pivot_root (while host /proc is still accessible)
     {

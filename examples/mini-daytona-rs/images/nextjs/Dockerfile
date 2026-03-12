@@ -8,6 +8,9 @@ RUN mkdir -p /var/run/daytona_home/tmp && chmod 777 /var/run/daytona_home/tmp
 # Install procps, curl, and wget
 RUN apt-get update && apt-get install -y procps curl wget && rm -rf /var/lib/apt/lists/*
 
+# Set npm to use Chinese mirror
+RUN npm config set registry https://registry.npmmirror.com
+
 # Create workspace directory
 RUN mkdir -p /home/daytona/workspace
 WORKDIR /home/daytona/workspace

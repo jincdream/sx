@@ -3,9 +3,12 @@ use crate::build::cache::{
     list_build_artifacts, prune_build_artifacts, BuildCachePruneMode, BuildCacheScope,
 };
 use crate::build::parser::{parse_dockerfile, Instruction};
-use crate::metadata::{load_metadata, register_snapshot, save_metadata, SandboxMetadata};
+use crate::metadata::{
+    get_volumes_dir, load_metadata, register_snapshot, save_metadata, MountConfig, SandboxMetadata,
+    VolumeMetadata,
+};
 use crate::overlay::OverlayMount;
-use crate::sandbox::{run_sandbox, ResourceLimits, SandboxProfile};
+use crate::sandbox::{run_sandbox, BindMount, ResourceLimits, SandboxProfile};
 use crate::snapshot::{create_archive, get_sandboxes_dir};
 use axum::response::sse::{Event, Sse};
 use axum::response::IntoResponse;
@@ -52,6 +55,9 @@ pub struct StartRequest {
     /// Optional resource limits for the sandbox
     #[serde(default)]
     resources: Option<ResourceLimits>,
+    /// Optional volume mounts
+    #[serde(default)]
+    mounts: Vec<MountConfig>,
 }
 
 #[derive(Serialize)]
@@ -170,6 +176,19 @@ pub struct FileReadQuery {
     path: String,
 }
 
+#[derive(Deserialize)]
+pub struct VolumeCreateRequest {
+    name: String,
+}
+
+#[derive(Serialize)]
+pub struct VolumeResponse {
+    id: String,
+    name: String,
+    path: String,
+    created_at: String,
+}
+
 pub async fn run_server() -> anyhow::Result<()> {
     // Initialize the network bridge for sandbox isolation
     crate::netns::ensure_bridge()?;
@@ -192,6 +211,9 @@ pub async fn run_server() -> anyhow::Result<()> {
         .route("/api/sandbox/{id}/download", get(handle_file_download))
         .route("/api/sandbox/{id}/suspend", post(handle_suspend))
         .route("/api/sandbox/{id}/resume", post(handle_resume))
+        .route("/api/volumes", post(handle_volume_create))
+        .route("/api/volumes", get(handle_volume_list))
+        .route("/api/volumes/{id}", delete(handle_volume_delete))
         .route("/api/sandbox/{id}/proxy/{port}", get(handle_proxy_root))
         .route("/api/sandbox/{id}/proxy/{port}/{*rest}", get(handle_proxy))
         .route("/api/sandbox/{id}/url/{port}", get(handle_sandbox_url))
@@ -281,6 +303,53 @@ fn resolve_sandbox_path(
     }
 
     Ok(canonical)
+}
+
+/// Resolve a file path for a sandbox, checking volume mounts first.
+/// If the path falls under a volume mount, resolve to the volume's host directory.
+/// Otherwise, fall back to the merged overlay directory.
+fn resolve_file_path(
+    sandbox: &SandboxMetadata,
+    metadata: &crate::metadata::Metadata,
+    user_path: &str,
+) -> anyhow::Result<std::path::PathBuf> {
+    for mount in &sandbox.mounts {
+        let mount_path = mount.mount_path.trim_end_matches('/');
+        let user_trimmed = user_path.trim_end_matches('/');
+        if user_trimmed == mount_path || user_trimmed.starts_with(&format!("{}/", mount_path)) {
+            let volume = metadata
+                .volumes
+                .get(&mount.volume_id)
+                .ok_or_else(|| anyhow::anyhow!("Volume {} not found", mount.volume_id))?;
+            let relative = user_path
+                .strip_prefix(mount_path)
+                .unwrap_or("")
+                .trim_start_matches('/');
+            if relative.split('/').any(|c| c == "..") {
+                anyhow::bail!("Path contains '..' traversal component");
+            }
+            let target = if relative.is_empty() {
+                volume.path.clone()
+            } else {
+                volume.path.join(relative)
+            };
+            return Ok(target);
+        }
+    }
+    let merged_dir = sandbox.dir.join("merged");
+    resolve_sandbox_path(&merged_dir, user_path)
+}
+
+/// Check if a path is under a read-only volume mount.
+fn is_readonly_mount(sandbox: &SandboxMetadata, user_path: &str) -> bool {
+    for mount in &sandbox.mounts {
+        let mount_path = mount.mount_path.trim_end_matches('/');
+        let user_trimmed = user_path.trim_end_matches('/');
+        if user_trimmed == mount_path || user_trimmed.starts_with(&format!("{}/", mount_path)) {
+            return mount.readonly;
+        }
+    }
+    false
 }
 
 async fn handle_info() -> Json<ApiResponse<ServerInfoResponse>> {
@@ -422,6 +491,7 @@ async fn handle_start(
     let result: anyhow::Result<StartResponse> = tokio::task::spawn_blocking(move || {
         let snapshot_path = PathBuf::from(payload.snapshot);
         let resource_limits = payload.resources.unwrap_or_default();
+        let mount_configs = payload.mounts;
         let sandbox_id = Uuid::new_v4().to_string();
         let sandbox_dir = get_sandboxes_dir()?.join(&sandbox_id);
 
@@ -433,6 +503,28 @@ async fn handle_start(
             .max_by(|left, right| left.created_at.cmp(&right.created_at))
             .map(|snapshot| snapshot.id.clone())
             .unwrap_or_default();
+
+        // Resolve and validate volume mounts
+        let bind_mounts: Vec<BindMount> = mount_configs
+            .iter()
+            .map(|mc| {
+                let volume = metadata
+                    .volumes
+                    .get(&mc.volume_id)
+                    .ok_or_else(|| anyhow::anyhow!("Volume {} not found", mc.volume_id))?;
+                if !mc.mount_path.starts_with('/') {
+                    anyhow::bail!("mount_path must be absolute: {}", mc.mount_path);
+                }
+                if mc.mount_path.contains("..") {
+                    anyhow::bail!("mount_path must not contain '..': {}", mc.mount_path);
+                }
+                Ok(BindMount {
+                    host_path: volume.path.clone(),
+                    container_path: mc.mount_path.clone(),
+                    readonly: mc.readonly,
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
 
         let upper_dir = sandbox_dir.join("upper");
         let work_dir = sandbox_dir.join("work");
@@ -455,6 +547,7 @@ async fn handle_start(
                 pid: None,
                 ip: None,
                 resources: resource_limits.clone(),
+                mounts: mount_configs,
             },
         );
         save_metadata(&metadata)?;
@@ -473,6 +566,7 @@ async fn handle_start(
                 Some(&resource_limits),
                 None,
                 SandboxProfile::Runtime,
+                &bind_mounts,
             ) {
                 error!("Sandbox {} failed: {}", local_sandbox_id, e);
             }
@@ -502,6 +596,7 @@ async fn handle_start(
 pub struct ListResponse {
     snapshots: Vec<crate::metadata::SnapshotMetadata>,
     sandboxes: Vec<crate::metadata::SandboxMetadata>,
+    volumes: Vec<crate::metadata::VolumeMetadata>,
 }
 
 async fn handle_list() -> Json<ApiResponse<ListResponse>> {
@@ -510,6 +605,7 @@ async fn handle_list() -> Json<ApiResponse<ListResponse>> {
         Ok::<ListResponse, anyhow::Error>(ListResponse {
             snapshots: metadata.snapshots.into_values().collect(),
             sandboxes: metadata.sandboxes.into_values().collect(),
+            volumes: metadata.volumes.into_values().collect(),
         })
     })
     .await
@@ -867,8 +963,7 @@ async fn handle_file_read(
     let result = tokio::task::spawn_blocking(move || {
         let metadata = load_metadata()?;
         if let Some(sandbox) = metadata.sandboxes.get(&id) {
-            let merged_dir = sandbox.dir.join("merged");
-            let target = resolve_sandbox_path(&merged_dir, &query.path)?;
+            let target = resolve_file_path(sandbox, &metadata, &query.path)?;
             let content = std::fs::read_to_string(target)?;
             Ok(content)
         } else {
@@ -899,8 +994,10 @@ async fn handle_file_write(
     let result = tokio::task::spawn_blocking(move || {
         let metadata = load_metadata()?;
         if let Some(sandbox) = metadata.sandboxes.get(&id) {
-            let merged_dir = sandbox.dir.join("merged");
-            let target = resolve_sandbox_path(&merged_dir, &payload.path)?;
+            if is_readonly_mount(sandbox, &payload.path) {
+                anyhow::bail!("Cannot write to read-only volume mount");
+            }
+            let target = resolve_file_path(sandbox, &metadata, &payload.path)?;
 
             if let Some(parent) = target.parent() {
                 std::fs::create_dir_all(parent)?;
@@ -936,8 +1033,10 @@ async fn handle_file_delete(
     let result = tokio::task::spawn_blocking(move || {
         let metadata = load_metadata()?;
         if let Some(sandbox) = metadata.sandboxes.get(&id) {
-            let merged_dir = sandbox.dir.join("merged");
-            let target = resolve_sandbox_path(&merged_dir, &payload.path)?;
+            if is_readonly_mount(sandbox, &payload.path) {
+                anyhow::bail!("Cannot delete from read-only volume mount");
+            }
+            let target = resolve_file_path(sandbox, &metadata, &payload.path)?;
 
             if target.is_dir() {
                 std::fs::remove_dir_all(&target)?;
@@ -977,8 +1076,10 @@ async fn handle_file_upload(
 
         let metadata = load_metadata()?;
         if let Some(sandbox) = metadata.sandboxes.get(&id) {
-            let merged_dir = sandbox.dir.join("merged");
-            let target = resolve_sandbox_path(&merged_dir, &payload.path)?;
+            if is_readonly_mount(sandbox, &payload.path) {
+                anyhow::bail!("Cannot upload to read-only volume mount");
+            }
+            let target = resolve_file_path(sandbox, &metadata, &payload.path)?;
 
             if let Some(parent) = target.parent() {
                 std::fs::create_dir_all(parent)?;
@@ -1025,8 +1126,7 @@ async fn handle_file_download(
 
         let metadata = load_metadata()?;
         if let Some(sandbox) = metadata.sandboxes.get(&id) {
-            let merged_dir = sandbox.dir.join("merged");
-            let target = resolve_sandbox_path(&merged_dir, &query.path)?;
+            let target = resolve_file_path(sandbox, &metadata, &query.path)?;
             let bytes = std::fs::read(&target)?;
             let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
             Ok(encoded)
@@ -1139,6 +1239,124 @@ async fn handle_sandbox_url(
         data: Some(serde_json::json!({ "url": url })),
         error: None,
     })
+}
+
+async fn handle_volume_create(
+    Json(payload): Json<VolumeCreateRequest>,
+) -> Json<ApiResponse<VolumeResponse>> {
+    let result = tokio::task::spawn_blocking(move || {
+        let volume_id = Uuid::new_v4().to_string();
+        let volume_dir = get_volumes_dir()?.join(&volume_id);
+        std::fs::create_dir_all(&volume_dir)?;
+
+        let now = Utc::now().to_rfc3339();
+        let volume = VolumeMetadata {
+            id: volume_id.clone(),
+            name: payload.name.clone(),
+            path: volume_dir.clone(),
+            created_at: now.clone(),
+        };
+
+        let mut metadata = load_metadata()?;
+        metadata.volumes.insert(volume_id.clone(), volume);
+        save_metadata(&metadata)?;
+
+        Ok(VolumeResponse {
+            id: volume_id,
+            name: payload.name,
+            path: volume_dir.to_string_lossy().to_string(),
+            created_at: now,
+        })
+    })
+    .await
+    .unwrap_or_else(|e| Err(anyhow::anyhow!("Task panic: {}", e)));
+
+    match result {
+        Ok(data) => Json(ApiResponse {
+            success: true,
+            data: Some(data),
+            error: None,
+        }),
+        Err(e) => Json(ApiResponse {
+            success: false,
+            data: None,
+            error: Some(e.to_string()),
+        }),
+    }
+}
+
+async fn handle_volume_list() -> Json<ApiResponse<Vec<VolumeResponse>>> {
+    let result = tokio::task::spawn_blocking(|| {
+        let metadata = load_metadata()?;
+        let volumes: Vec<VolumeResponse> = metadata
+            .volumes
+            .into_values()
+            .map(|v| VolumeResponse {
+                id: v.id,
+                name: v.name,
+                path: v.path.to_string_lossy().to_string(),
+                created_at: v.created_at,
+            })
+            .collect();
+        Ok::<_, anyhow::Error>(volumes)
+    })
+    .await
+    .unwrap_or_else(|e| Err(anyhow::anyhow!("Task panic: {}", e)));
+
+    match result {
+        Ok(data) => Json(ApiResponse {
+            success: true,
+            data: Some(data),
+            error: None,
+        }),
+        Err(e) => Json(ApiResponse {
+            success: false,
+            data: None,
+            error: Some(e.to_string()),
+        }),
+    }
+}
+
+async fn handle_volume_delete(Path(id): Path<String>) -> Json<ApiResponse<String>> {
+    let result = tokio::task::spawn_blocking(move || {
+        let mut metadata = load_metadata()?;
+
+        // Refuse deletion if any running sandbox is using this volume
+        for sandbox in metadata.sandboxes.values() {
+            if sandbox.mounts.iter().any(|m| m.volume_id == id) {
+                anyhow::bail!(
+                    "Volume {} is in use by sandbox {}",
+                    id,
+                    sandbox.id
+                );
+            }
+        }
+
+        if let Some(volume) = metadata.volumes.remove(&id) {
+            if volume.path.exists() {
+                std::fs::remove_dir_all(&volume.path)?;
+            }
+            save_metadata(&metadata)?;
+            Ok(format!("Deleted volume {}", id))
+        } else {
+            anyhow::bail!("Volume {} not found", id);
+        }
+    })
+    .await
+    .unwrap_or_else(|e| Err(anyhow::anyhow!("Task panic: {}", e)));
+
+    match result {
+        Ok(data) => Json(ApiResponse {
+            success: true,
+            data: Some(data),
+            error: None,
+        }),
+        Err(e) => Json(ApiResponse {
+            success: false,
+            data: None,
+            error: Some(e.to_string()),
+        }),
+    }
 }
 
 async fn handle_proxy_root(Path((id, port)): Path<(String, u16)>) -> axum::response::Response {

@@ -1082,6 +1082,119 @@ except Exception as e:
   }
   }
 
+  // ===============================
+  // Test 8: Shared Volume Mount Test
+  // ===============================
+  if (shouldRunTest('volume') || shouldRunTest('mount')) {
+    console.log('\n--- Starting Shared Volume Mount Test ---');
+
+  // 1. Create a volume
+  console.log('\n[1] Creating a shared volume...');
+  const volCreateRes = await timedRequest('Volume', 'create', 'POST', '/volumes', {
+    name: 'e2e-shared-vol'
+  });
+  console.log('Volume Create Response:', volCreateRes.data);
+  assert(volCreateRes.data.success === true, 'Volume creation failed');
+  const volumeId = volCreateRes.data.data.id;
+  const volumeName = volCreateRes.data.data.name;
+  assert(volumeId, 'Volume ID is missing');
+  assert(volumeName === 'e2e-shared-vol', 'Volume name mismatch');
+
+  // 2. List volumes and verify
+  console.log('\n[2] Listing volumes...');
+  const volListRes = await timedRequest('Volume', 'list', 'GET', '/volumes');
+  console.log('Volume List Response:', volListRes.data);
+  assert(volListRes.data.success === true, 'Volume list failed');
+  const foundVol = volListRes.data.data.find(v => v.id === volumeId);
+  assert(foundVol, 'Created volume not found in list');
+  assert(foundVol.name === 'e2e-shared-vol', 'Volume name mismatch in list');
+
+  // 3. Build snapshot for volume test
+  console.log('\n[3] Building snapshot for volume test...');
+  await new Promise(r => setTimeout(r, 2000));
+  const volBuildRes = await timedRequest('Volume', 'build', 'POST', '/build', {
+    dockerfile: getBuildPath('images/nginx/Dockerfile'),
+    context: getBuildPath('images/nginx')
+  });
+  assert(volBuildRes.data.success === true, 'Volume test build failed');
+  const volSnapshotPath = volBuildRes.data.data.snapshot_path;
+
+  // 4. Start Sandbox A with volume mounted (read-write)
+  console.log('\n[4] Starting Sandbox A with shared volume...');
+  const sandboxARes = await timedRequest('Volume', 'start_a', 'POST', '/start', {
+    snapshot: volSnapshotPath,
+    mounts: [{ volume_id: volumeId, mount_path: '/shared-data', readonly: false }]
+  });
+  console.log('Sandbox A Start Response:', sandboxARes.data);
+  assert(sandboxARes.data.success === true, 'Sandbox A start failed');
+  const sandboxAId = sandboxARes.data.data.sandbox_id;
+
+  await new Promise(r => setTimeout(r, 3000));
+
+  // 5. Write a file into the shared volume via Sandbox A
+  console.log('\n[5] Writing file to shared volume via Sandbox A...');
+  const volWriteRes = await timedRequest('Volume', 'file_write_a', 'POST', `/sandbox/${sandboxAId}/file`, {
+    path: '/shared-data/hello.txt',
+    content: 'Hello from Sandbox A!'
+  });
+  console.log('Volume Write Response:', volWriteRes.data);
+  assert(volWriteRes.data.success === true, 'Volume file write via Sandbox A failed');
+
+  // 6. Read back from Sandbox A to confirm
+  console.log('\n[6] Reading file from shared volume via Sandbox A...');
+  const volReadARes = await timedRequest('Volume', 'file_read_a', 'GET', `/sandbox/${sandboxAId}/file?path=/shared-data/hello.txt`);
+  console.log('Volume Read (A) Response:', volReadARes.data);
+  assert(volReadARes.data.success === true, 'Volume file read via Sandbox A failed');
+  assert(volReadARes.data.data === 'Hello from Sandbox A!', 'Volume file content mismatch in Sandbox A');
+
+  // 7. Start Sandbox B with the same volume mounted (read-only)
+  console.log('\n[7] Starting Sandbox B with same shared volume (read-only)...');
+  const sandboxBRes = await timedRequest('Volume', 'start_b', 'POST', '/start', {
+    snapshot: volSnapshotPath,
+    mounts: [{ volume_id: volumeId, mount_path: '/shared-data', readonly: true }]
+  });
+  console.log('Sandbox B Start Response:', sandboxBRes.data);
+  assert(sandboxBRes.data.success === true, 'Sandbox B start failed');
+  const sandboxBId = sandboxBRes.data.data.sandbox_id;
+
+  await new Promise(r => setTimeout(r, 3000));
+
+  // 8. Read the file from Sandbox B — verifying cross-sandbox volume sharing
+  console.log('\n[8] Reading file from shared volume via Sandbox B...');
+  const volReadBRes = await timedRequest('Volume', 'file_read_b', 'GET', `/sandbox/${sandboxBId}/file?path=/shared-data/hello.txt`);
+  console.log('Volume Read (B) Response:', volReadBRes.data);
+  assert(volReadBRes.data.success === true, 'Volume file read via Sandbox B failed');
+  assert(volReadBRes.data.data === 'Hello from Sandbox A!', 'Shared volume content mismatch — Sandbox B cannot see data written by Sandbox A');
+  console.log('  ✅ Cross-sandbox volume sharing verified!');
+
+  // 9. Attempt to delete the volume while sandboxes are running (should fail)
+  console.log('\n[9] Attempting to delete volume while in use (expect failure)...');
+  const volDeleteFailRes = await timedRequest('Volume', 'delete_fail', 'DELETE', `/volumes/${volumeId}`);
+  console.log('Volume Delete (in-use) Response:', volDeleteFailRes.data);
+  assert(volDeleteFailRes.data.success === false, 'Volume deletion should have been rejected while in use');
+
+  // 10. Destroy both sandboxes
+  console.log('\n[10] Destroying Sandbox A and B...');
+  const destroyARes = await timedRequest('Volume', 'destroy_a', 'DELETE', `/sandbox/${sandboxAId}`);
+  assert(destroyARes.data.success === true, 'Sandbox A destroy failed');
+  const destroyBRes = await timedRequest('Volume', 'destroy_b', 'DELETE', `/sandbox/${sandboxBId}`);
+  assert(destroyBRes.data.success === true, 'Sandbox B destroy failed');
+
+  // 11. Now delete the volume (should succeed)
+  console.log('\n[11] Deleting volume after sandboxes destroyed...');
+  const volDeleteRes = await timedRequest('Volume', 'delete', 'DELETE', `/volumes/${volumeId}`);
+  console.log('Volume Delete Response:', volDeleteRes.data);
+  assert(volDeleteRes.data.success === true, 'Volume deletion failed');
+
+  // 12. Verify volume is gone from the list
+  console.log('\n[12] Verifying volume is deleted...');
+  const volListAfterRes = await timedRequest('Volume', 'list_after', 'GET', '/volumes');
+  assert(volListAfterRes.data.success === true, 'Volume list after delete failed');
+  const deletedVol = volListAfterRes.data.data.find(v => v.id === volumeId);
+  assert(!deletedVol, 'Deleted volume still appears in list');
+  console.log('  ✅ Volume lifecycle test passed!');
+  }
+
   console.log('\n✅ All API tests passed successfully!');
 
   // Print performance report

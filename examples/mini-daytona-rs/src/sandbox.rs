@@ -1,4 +1,6 @@
 #![allow(unused)]
+use std::path::PathBuf;
+
 /// Security profile that controls the isolation level of a sandbox.
 /// Build sandboxes need more privileges (e.g. apt-get, npm install).
 /// Runtime sandboxes are locked down for defense-in-depth.
@@ -54,6 +56,17 @@ impl Default for ResourceLimits {
             disk_bytes: Some(2_147_483_648), // 2 GiB
         }
     }
+}
+
+/// A bind mount to be applied inside the sandbox (e.g. shared volumes).
+#[derive(Debug, Clone)]
+pub struct BindMount {
+    /// Absolute path on the host filesystem.
+    pub host_path: PathBuf,
+    /// Absolute path inside the container, e.g. "/data".
+    pub container_path: String,
+    /// If true, mounted read-only.
+    pub readonly: bool,
 }
 
 // Re-export the platform-specific run_sandbox at the module level

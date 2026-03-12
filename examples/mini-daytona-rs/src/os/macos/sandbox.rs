@@ -1,7 +1,7 @@
 use std::process::Command;
 use tracing::info;
 
-use crate::sandbox::{ResourceLimits, SandboxProfile};
+use crate::sandbox::{BindMount, ResourceLimits, SandboxProfile};
 
 pub fn run_sandbox(
     sandbox_id: &str,
@@ -10,12 +10,32 @@ pub fn run_sandbox(
     _limits: Option<&ResourceLimits>,
     workdir: Option<&str>,
     _profile: SandboxProfile,
+    bind_mounts: &[BindMount],
 ) -> anyhow::Result<()> {
     info!(
         "[macOS] Starting sandbox {} (no isolation — development mode)",
         sandbox_id
     );
     info!("[macOS] merged_dir = {}", merged_dir);
+
+    // Simulate bind mounts via symlinks on macOS
+    for bm in bind_mounts {
+        let target = format!("{}{}", merged_dir, bm.container_path);
+        let target_path = std::path::Path::new(&target);
+        if let Some(parent) = target_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        // Remove existing file/dir/symlink at the target so we can create a fresh symlink
+        if target_path.exists() || target_path.symlink_metadata().is_ok() {
+            let _ = std::fs::remove_dir_all(target_path);
+        }
+        std::os::unix::fs::symlink(&bm.host_path, target_path)?;
+        info!(
+            "[macOS] Volume symlinked: {} -> {}",
+            bm.host_path.display(),
+            bm.container_path
+        );
+    }
 
     if cmd.is_empty() {
         info!("[macOS] No command specified, running /bin/sh (sandbox-exec)");

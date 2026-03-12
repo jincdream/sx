@@ -17,6 +17,26 @@ pub struct SnapshotMetadata {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VolumeMetadata {
+    pub id: String,
+    pub name: String,
+    pub path: PathBuf,
+    pub created_at: String,
+}
+
+/// Describes a volume mount inside a sandbox.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MountConfig {
+    /// Volume ID to mount
+    pub volume_id: String,
+    /// Absolute path inside the container, e.g. "/data"
+    pub mount_path: String,
+    /// Mount the volume read-only (default: false)
+    #[serde(default)]
+    pub readonly: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SandboxMetadata {
     pub id: String,
     pub snapshot_id: String,
@@ -29,6 +49,9 @@ pub struct SandboxMetadata {
     pub ip: Option<String>,
     #[serde(default)]
     pub resources: ResourceLimits,
+    /// Volumes mounted into this sandbox
+    #[serde(default)]
+    pub mounts: Vec<MountConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -47,6 +70,15 @@ pub struct Metadata {
     pub sandboxes: HashMap<String, SandboxMetadata>,
     #[serde(default)]
     pub build_artifacts: HashMap<String, BuildArtifactMetadata>,
+    #[serde(default)]
+    pub volumes: HashMap<String, VolumeMetadata>,
+}
+
+pub fn get_volumes_dir() -> anyhow::Result<PathBuf> {
+    let home = std::env::var("HOME")?;
+    let dir = PathBuf::from(home).join(".mini-daytona/volumes");
+    fs::create_dir_all(&dir)?;
+    Ok(dir)
 }
 
 pub fn get_metadata_dir() -> anyhow::Result<PathBuf> {
