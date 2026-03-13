@@ -18,6 +18,7 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Step 1: Cache dependencies — only re-runs when Cargo.toml changes
+COPY .cargo/config.toml .cargo/config.toml
 COPY Cargo.toml Cargo.lock* ./
 RUN mkdir src && echo 'fn main() {}' > src/main.rs && \
     cargo build --release && \
