@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1.7
 FROM rust:latest
 
 # Use Tsinghua mirror for faster downloads (works on both amd64 and arm64)
@@ -9,24 +10,29 @@ RUN if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
 
 WORKDIR /work
 
-RUN apt-get update && apt-get install -y \
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+    apt-get update && apt-get install -y \
     pkg-config \
     libssl-dev \
     libseccomp-dev \
     iproute2 \
-    iptables \
-    && rm -rf /var/lib/apt/lists/*
+    iptables
 
 # Step 1: Cache dependencies — only re-runs when Cargo.toml changes
 COPY .cargo/config.toml .cargo/config.toml
 COPY Cargo.toml Cargo.lock* ./
-RUN mkdir src && echo 'fn main() {}' > src/main.rs && \
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
+    mkdir src && echo 'fn main() {}' > src/main.rs && \
     cargo build --release && \
     rm -rf src target/release/mini-daytona-rs target/release/deps/mini_daytona_rs-* target/release/.fingerprint/mini-daytona-rs-*
 
 # Step 2: Build actual source — uses cached deps from above
 COPY . .
-RUN cargo build --release
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
+    cargo build --release
 
 # Setup a test directory with Nginx dummy Dockerfile for integration testing
 # RUN mkdir -p /work/tests/e2e && \
