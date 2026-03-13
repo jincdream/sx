@@ -45,6 +45,10 @@ pub struct ApiResponse<T> {
 pub struct BuildRequest {
     dockerfile: String,
     context: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -310,12 +314,14 @@ fn resolve_image_dir(name: &str) -> anyhow::Result<PathBuf> {
 fn build_snapshot_from_paths(
     dockerfile_path: PathBuf,
     context_path: PathBuf,
+    name: Option<String>,
+    description: Option<String>,
 ) -> anyhow::Result<BuildResponse> {
     let snapshot_path = build(&dockerfile_path, &context_path)?;
     let (entrypoint, cmd, env) = extract_snapshot_config(&dockerfile_path)?;
 
     let mut metadata = load_metadata()?;
-    let snapshot_id = register_snapshot(&mut metadata, snapshot_path.clone(), entrypoint, cmd, env);
+    let snapshot_id = register_snapshot(&mut metadata, snapshot_path.clone(), entrypoint, cmd, env, name, description);
     save_metadata(&metadata)?;
 
     Ok(BuildResponse {
@@ -543,7 +549,7 @@ async fn handle_image_build(Path(name): Path<String>) -> Json<ApiResponse<BuildR
     let result = tokio::task::spawn_blocking(move || {
         let dir = resolve_image_dir(&name)?;
         let dockerfile_path = dir.join("Dockerfile");
-        build_snapshot_from_paths(dockerfile_path, dir)
+        build_snapshot_from_paths(dockerfile_path, dir, Some(name), None)
     })
     .await
     .unwrap_or_else(|e| Err(anyhow::anyhow!("Task panic: {}", e)));
@@ -572,7 +578,7 @@ async fn handle_build(
     );
 
     let result: anyhow::Result<BuildResponse> = tokio::task::spawn_blocking(move || {
-        build_snapshot_from_paths(PathBuf::from(payload.dockerfile), PathBuf::from(payload.context))
+        build_snapshot_from_paths(PathBuf::from(payload.dockerfile), PathBuf::from(payload.context), payload.name, payload.description)
     })
     .await
     .unwrap_or_else(|e| Err(anyhow::anyhow!("Task panic: {}", e)));
@@ -821,7 +827,7 @@ async fn handle_snapshot(
             let output = PathBuf::from(&payload.output);
             create_archive(&merged_dir, &output)?;
             let mut writable_metadata = load_metadata()?;
-            register_snapshot(&mut writable_metadata, output.clone(), None, None, None);
+            register_snapshot(&mut writable_metadata, output.clone(), None, None, None, None, None);
             save_metadata(&writable_metadata)?;
             Ok(payload.output)
         } else {
@@ -870,6 +876,8 @@ async fn handle_snapshot_create_from_sandbox(
                 entrypoint: None,
                 cmd: None,
                 env: None,
+                name: None,
+                description: None,
             },
         );
         save_metadata(&writable_metadata)?;

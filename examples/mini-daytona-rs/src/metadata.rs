@@ -14,6 +14,10 @@ pub struct SnapshotMetadata {
     pub entrypoint: Option<Vec<String>>,
     pub cmd: Option<Vec<String>>,
     pub env: Option<Vec<String>>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -115,6 +119,8 @@ pub fn register_snapshot(
     entrypoint: Option<Vec<String>>,
     cmd: Option<Vec<String>>,
     env: Option<Vec<String>>,
+    name: Option<String>,
+    description: Option<String>,
 ) -> String {
     let snapshot_id = Uuid::new_v4().to_string();
     metadata.snapshots.insert(
@@ -126,6 +132,8 @@ pub fn register_snapshot(
             entrypoint,
             cmd,
             env,
+            name,
+            description,
         },
     );
     snapshot_id

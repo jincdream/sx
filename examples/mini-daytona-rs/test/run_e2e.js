@@ -1198,6 +1198,28 @@ except Exception as e:
   console.log('  ✅ Volume lifecycle test passed!');
   }
 
+  // ===============================
+  // Cleanup: Delete all snapshots created during tests
+  // ===============================
+  console.log('\n--- Cleaning up snapshots ---');
+  try {
+    const listRes = await request('GET', '/list');
+    if (listRes.data?.success && listRes.data?.data?.snapshots) {
+      const snapshots = listRes.data.data.snapshots;
+      console.log(`Found ${snapshots.length} snapshot(s) to clean up.`);
+      for (const snap of snapshots) {
+        const delRes = await timedRequest('Cleanup', 'delete_snapshot', 'DELETE', `/snapshots/${snap.id}`);
+        if (delRes.data?.success) {
+          console.log(`  Deleted snapshot ${snap.id}${snap.name ? ` (${snap.name})` : ''}`);
+        } else {
+          console.warn(`  Failed to delete snapshot ${snap.id}: ${delRes.data?.error || 'unknown'}`);
+        }
+      }
+    }
+  } catch (err) {
+    console.warn(`Snapshot cleanup failed: ${err.message}`);
+  }
+
   console.log('\n✅ All API tests passed successfully!');
 
   // Print performance report

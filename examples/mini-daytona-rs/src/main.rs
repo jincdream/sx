@@ -112,7 +112,7 @@ fn main() -> Result<()> {
             info!("Snapshot created: {:?}", snapshot_path);
 
             let mut metadata = load_metadata().context("Failed to load metadata")?;
-            register_snapshot(&mut metadata, snapshot_path, None, None, None);
+            register_snapshot(&mut metadata, snapshot_path, None, None, None, None, None);
             save_metadata(&metadata).context("Failed to save metadata")?;
         }
         Commands::Start { snapshot } => {
