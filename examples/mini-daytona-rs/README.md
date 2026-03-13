@@ -54,6 +54,26 @@ node test/run_e2e.js --client
 REBUILD=1 NO_CACHE=1 bash start-docker.sh
 ```
 
+如果只需要服务端二进制，而不想在其他地方重复执行 `docker build -f Dockerfile .`，可以直接从这个 Dockerfile 导出产物：
+
+```bash
+bash build-artifact.sh
+```
+
+默认会导出到 `dist/linux-amd64/mini-daytona-rs` 或 `dist/linux-arm64/mini-daytona-rs`。后续在 Linux 主机上可以直接复用该产物：
+
+```bash
+BINARY_PATH=./dist/linux-amd64/mini-daytona-rs SKIP_BUILD=1 bash start-local.sh
+```
+
+如果是本地 e2e，也可以直接复用这个产物，避免再依赖 Cargo 编译链路：
+
+```bash
+BINARY_PATH=./dist/linux-amd64/mini-daytona-rs SKIP_RUST_CHECKS=1 node test/run_e2e.js
+```
+
+注意：通过 Dockerfile 导出的产物是 Linux 二进制，不能直接在 macOS 上运行；macOS 仍然需要使用 `cargo build` 生成本机二进制，或者继续走 Docker 容器启动链路。
+
 验证过的集成测试覆盖：
 
 - Nginx 静态文件场景

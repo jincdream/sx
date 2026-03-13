@@ -6,6 +6,11 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 const CLIENT_ONLY = process.argv.includes('--client');
+const SERVER_BINARY = process.env.BINARY_PATH || './target/release/mini-daytona-rs';
+const SKIP_RUST_CHECKS = process.env.SKIP_RUST_CHECKS === '1' || !!process.env.BINARY_PATH;
+const API_HOST = process.env.API_HOST || '127.0.0.1';
+const API_PORT = process.env.API_PORT || '3000';
+const API_BASE = process.env.API_BASE || `http://${API_HOST}:${API_PORT}/api`;
 
 const testArg = process.argv.find(a => a.startsWith('--test='));
 const TEST_FILTER = testArg ? testArg.split('=')[1].toLowerCase() : null;
@@ -37,8 +42,6 @@ if (!CLIENT_ONLY) {
     }
   }
 }
-
-const API_BASE = 'http://localhost:3000/api';
 
 const http = require('node:http');
 
@@ -1218,13 +1221,15 @@ async function main() {
 
   console.log("--- Setup ---");
   const projectRoot = path.resolve(__dirname, '..');
-  // Run checks
-  spawnSync('cargo', ['fmt', '--', '--check'], { stdio: 'inherit', cwd: projectRoot });
-  spawnSync('cargo', ['clippy', '--', '-D', 'warnings'], { stdio: 'inherit', cwd: projectRoot });
-  spawnSync('cargo', ['test'], { stdio: 'inherit', cwd: projectRoot });
+  if (!SKIP_RUST_CHECKS) {
+    // Run checks when testing the locally built project binary.
+    spawnSync('cargo', ['fmt', '--', '--check'], { stdio: 'inherit', cwd: projectRoot });
+    spawnSync('cargo', ['clippy', '--', '-D', 'warnings'], { stdio: 'inherit', cwd: projectRoot });
+    spawnSync('cargo', ['test'], { stdio: 'inherit', cwd: projectRoot });
+  }
 
   console.log("--- Starting Server ---");
-  const server = spawn('./target/release/mini-daytona-rs', ['server'], { stdio: 'inherit', cwd: projectRoot });
+  const server = spawn(SERVER_BINARY, ['server'], { stdio: 'inherit', cwd: projectRoot });
 
   // Wait for server to boot
   await new Promise(r => setTimeout(r, 3000));

@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1.7
-FROM rust:latest
+FROM rust:latest AS builder
 
 # Use Tsinghua mirror for faster downloads (works on both amd64 and arm64)
 RUN if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
@@ -33,6 +33,11 @@ COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     cargo build --release
+
+FROM scratch AS artifact
+COPY --from=builder /work/target/release/mini-daytona-rs /mini-daytona-rs
+
+FROM builder AS runtime
 
 # Setup a test directory with Nginx dummy Dockerfile for integration testing
 # RUN mkdir -p /work/tests/e2e && \

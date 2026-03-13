@@ -24,6 +24,7 @@ PORT="${PORT:-3000}"
 BUILD_MODE="${BUILD_MODE:-release}"   # release 或 debug
 DATA_DIR="${DATA_DIR:-$HOME/.mini-daytona}"
 SKIP_BUILD="${SKIP_BUILD:-0}"         # 设为 1 跳过编译
+BINARY_PATH="${BINARY_PATH:-}"
 HOST_OS="$(uname -s)"
 
 # ---- 颜色 ----
@@ -36,25 +37,38 @@ err()   { echo -e "${RED}[ERROR]${NC} $*"; }
 
 # ---- 依赖检查 ----
 missing=()
-command -v cargo &>/dev/null || missing+=("cargo (Rust 工具链)")
+
+USING_PREBUILT_BINARY=0
+if [ -n "$BINARY_PATH" ]; then
+    USING_PREBUILT_BINARY=1
+fi
+
+if [ "$USING_PREBUILT_BINARY" != "1" ]; then
+    command -v cargo &>/dev/null || missing+=("cargo (Rust 工具链)")
+fi
 
 if [ "$HOST_OS" = "Linux" ]; then
-    command -v pkg-config &>/dev/null || missing+=("pkg-config")
     command -v ip &>/dev/null || missing+=("iproute2")
     command -v iptables &>/dev/null || missing+=("iptables")
 
-    if ! pkg-config --exists libseccomp 2>/dev/null; then
-        missing+=("libseccomp-dev")
-    fi
-    if ! pkg-config --exists openssl 2>/dev/null; then
-        missing+=("libssl-dev")
+    if [ "$USING_PREBUILT_BINARY" != "1" ]; then
+        command -v pkg-config &>/dev/null || missing+=("pkg-config")
+
+        if ! pkg-config --exists libseccomp 2>/dev/null; then
+            missing+=("libseccomp-dev")
+        fi
+        if ! pkg-config --exists openssl 2>/dev/null; then
+            missing+=("libssl-dev")
+        fi
     fi
 elif [ "$HOST_OS" = "Darwin" ]; then
-    command -v clang &>/dev/null || missing+=("clang (Xcode Command Line Tools)")
-    command -v pkg-config &>/dev/null || missing+=("pkg-config")
+    if [ "$USING_PREBUILT_BINARY" != "1" ]; then
+        command -v clang &>/dev/null || missing+=("clang (Xcode Command Line Tools)")
+        command -v pkg-config &>/dev/null || missing+=("pkg-config")
 
-    if command -v pkg-config &>/dev/null && ! pkg-config --exists openssl 2>/dev/null; then
-        missing+=("openssl")
+        if command -v pkg-config &>/dev/null && ! pkg-config --exists openssl 2>/dev/null; then
+            missing+=("openssl")
+        fi
     fi
 else
     err "当前系统暂不支持: $HOST_OS"
@@ -89,7 +103,9 @@ if [ "$HOST_OS" = "Linux" ] && [ "$(id -u)" -ne 0 ]; then
 fi
 
 # ---- 编译 ----
-if [ "$SKIP_BUILD" != "1" ]; then
+if [ "$USING_PREBUILT_BINARY" = "1" ]; then
+    info "使用现成二进制: $BINARY_PATH"
+elif [ "$SKIP_BUILD" != "1" ]; then
     info "编译项目 (${BUILD_MODE} 模式)..."
     if [ "$BUILD_MODE" = "release" ]; then
         cargo build --release
@@ -102,7 +118,9 @@ else
 fi
 
 # ---- 确定二进制路径 ----
-if [ "$BUILD_MODE" = "release" ]; then
+if [ "$USING_PREBUILT_BINARY" = "1" ]; then
+    BINARY="$BINARY_PATH"
+elif [ "$BUILD_MODE" = "release" ]; then
     BINARY="./target/release/mini-daytona-rs"
 else
     BINARY="./target/debug/mini-daytona-rs"
@@ -110,7 +128,11 @@ fi
 
 if [ ! -f "$BINARY" ]; then
     err "找不到二进制文件: $BINARY"
-    err "请先编译: cargo build --${BUILD_MODE}"
+    if [ "$USING_PREBUILT_BINARY" = "1" ]; then
+        err "请确认 BINARY_PATH 指向可执行文件"
+    else
+        err "请先编译: cargo build --${BUILD_MODE}"
+    fi
     exit 1
 fi
 
