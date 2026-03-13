@@ -1,7 +1,9 @@
-FROM python:3.9-slim
+FROM python:3.12-slim
 
 RUN mkdir -p /home/daytona/workspace
 WORKDIR /home/daytona/workspace
+
+ENV PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
 
 RUN pip install --no-cache-dir \
     pandas \

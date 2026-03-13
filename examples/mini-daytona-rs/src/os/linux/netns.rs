@@ -6,6 +6,11 @@ const SUBNET: &str = "10.200.0";
 const BRIDGE_IP: &str = "10.200.0.1/24";
 const BRIDGE_GATEWAY: &str = "10.200.0.1";
 
+fn should_ignore_netns_error(stderr: &str) -> bool {
+    let stderr = stderr.trim();
+    stderr.contains("File exists") || stderr.contains("RTNETLINK answers: File exists")
+}
+
 fn run_cmd(program: &str, args: &[&str]) -> anyhow::Result<()> {
     debug!("netns: {} {}", program, args.join(" "));
     let output = Command::new(program).args(args).output()?;
@@ -15,6 +20,22 @@ fn run_cmd(program: &str, args: &[&str]) -> anyhow::Result<()> {
         anyhow::bail!("{} {} failed: {}", program, args.join(" "), stderr.trim());
     }
     Ok(())
+}
+
+fn run_cmd_allow_exists(program: &str, args: &[&str]) -> anyhow::Result<()> {
+    debug!("netns (allow exists): {} {}", program, args.join(" "));
+    let output = Command::new(program).args(args).output()?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    debug!("netns cmd stderr: {}", stderr);
+    if should_ignore_netns_error(&stderr) {
+        return Ok(());
+    }
+
+    anyhow::bail!("{} {} failed: {}", program, args.join(" "), stderr.trim());
 }
 
 fn run_cmd_ignore(program: &str, args: &[&str]) {
@@ -27,11 +48,19 @@ fn run_cmd_ignore(program: &str, args: &[&str]) {
 pub fn ensure_bridge() -> anyhow::Result<()> {
     info!("Ensuring network bridge {} is configured", BRIDGE_NAME);
 
-    // 1. Create bridge (ignore error if already exists)
-    let _ = run_cmd("ip", &["link", "add", BRIDGE_NAME, "type", "bridge"]);
+    // 1. Create bridge. Only ignore the "already exists" case.
+    run_cmd_allow_exists("ip", &["link", "add", BRIDGE_NAME, "type", "bridge"]).map_err(
+        |err| {
+            anyhow::anyhow!(
+                "failed to create bridge {}: {}. If running inside Docker or a cloud container, start the container with --privileged or at least CAP_NET_ADMIN, CAP_SYS_ADMIN, writable /proc/sys, and access to iptables",
+                BRIDGE_NAME,
+                err
+            )
+        },
+    )?;
 
-    // 2. Assign IP address (ignore error if already assigned)
-    let _ = run_cmd("ip", &["addr", "add", BRIDGE_IP, "dev", BRIDGE_NAME]);
+    // 2. Assign IP address. Only ignore the "already exists" case.
+    run_cmd_allow_exists("ip", &["addr", "add", BRIDGE_IP, "dev", BRIDGE_NAME])?;
 
     // 3. Bring bridge up
     run_cmd("ip", &["link", "set", BRIDGE_NAME, "up"])?;

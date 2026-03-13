@@ -26,6 +26,16 @@
 
 当前推荐在 Docker 中启动，因为项目依赖 Linux namespace、OverlayFS、iptables 和 cgroups 等特性。
 
+仅仅通过 Dockerfile 构建镜像还不够。运行容器时必须提供宿主机级网络管理能力；否则 `ip link add daytona0 type bridge` 会因为缺少权限失败，旧代码又会把这个错误吞掉，最后表现成 `ip link set daytona0 up failed: Cannot find device "daytona0"`。
+
+云端部署时至少需要满足：
+
+- `--privileged`，或者显式授予 `CAP_NET_ADMIN`、`CAP_SYS_ADMIN`
+- 可写 `/proc/sys/net/ipv4/ip_forward`
+- 可执行 `iptables` NAT / FORWARD 规则
+
+如果你只是 `docker build` 后再用普通 `docker run` 启动，这个项目的 bridge/veth 网络模型不会工作。
+
 ## 快速开始
 
 启动项目的最合适方式是使用集成好的 Docker 环境，因为其依赖于纯净的 Linux 环境层特性（特权级权限、Namespace隔离等）：
