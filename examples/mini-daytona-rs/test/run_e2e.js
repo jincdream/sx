@@ -38,7 +38,7 @@ if (!CLIENT_ONLY) {
   }
 }
 
-const API_BASE = 'http://8.155.164.69:3000/api';
+const API_BASE = 'http://localhost:3000/api';
 
 const http = require('node:http');
 
