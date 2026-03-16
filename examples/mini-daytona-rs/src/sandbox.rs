@@ -4,7 +4,7 @@ use std::path::PathBuf;
 /// Security profile that controls the isolation level of a sandbox.
 /// Build sandboxes need more privileges (e.g. apt-get, npm install).
 /// Runtime sandboxes are locked down for defense-in-depth.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SandboxProfile {
     /// Used during `docker build`-style operations. More permissive:
     /// - Retains capabilities (setuid/setgroups for apt)
@@ -17,13 +17,8 @@ pub enum SandboxProfile {
     /// - Sets PR_SET_NO_NEW_PRIVS
     /// - Narrower seccomp profile (runtime denylist applied on top)
     /// - Extended /proc and /sys masking
+    #[default]
     Runtime,
-}
-
-impl Default for SandboxProfile {
-    fn default() -> Self {
-        SandboxProfile::Runtime
-    }
 }
 
 /// Configurable resource limits for a sandbox (cgroups v2).

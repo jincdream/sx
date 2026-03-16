@@ -89,6 +89,7 @@ pub struct ExecRequest {
 // Internal type enum for axum response combining either JSON or SSE stream
 pub enum ExecApiResult {
     Json(Json<ApiResponse<ExecResponse>>),
+    #[allow(clippy::type_complexity)]
     Sse(Sse<std::pin::Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>>),
 }
 
@@ -1032,7 +1033,7 @@ async fn handle_exec(Path(id): Path<String>, Json(payload): Json<ExecRequest>) -
         }));
     }
 
-    let metadata_res = tokio::task::spawn_blocking(|| load_metadata())
+    let metadata_res = tokio::task::spawn_blocking(load_metadata)
         .await
         .unwrap_or_else(|_| Err(anyhow::anyhow!("tokio spawn blocking failed")));
     let metadata = match metadata_res {
@@ -1160,7 +1161,7 @@ async fn handle_exec(Path(id): Path<String>, Json(payload): Json<ExecRequest>) -
                 #[cfg(unix)]
                 {
                     use std::os::unix::process::ExitStatusExt;
-                    output.status.signal().map(|s| signal_name(s))
+                    output.status.signal().map(signal_name)
                 }
                 #[cfg(not(unix))]
                 { None }
@@ -1223,13 +1224,11 @@ fn signal_name(sig: i32) -> String {
     }
 }
 
+type SnapshotConfig = (Option<Vec<String>>, Option<Vec<String>>, Option<Vec<String>>);
+
 fn extract_snapshot_config(
     dockerfile_path: &std::path::Path,
-) -> anyhow::Result<(
-    Option<Vec<String>>,
-    Option<Vec<String>>,
-    Option<Vec<String>>,
-)> {
+) -> anyhow::Result<SnapshotConfig> {
     let instructions = parse_dockerfile(dockerfile_path)?;
     let mut entrypoint = None;
     let mut cmd = None;
@@ -1503,7 +1502,7 @@ async fn handle_sandbox_url(
     headers: axum::http::HeaderMap,
     Path((id, port)): Path<(String, u16)>,
 ) -> Json<ApiResponse<serde_json::Value>> {
-    let metadata_res = tokio::task::spawn_blocking(|| load_metadata()).await;
+    let metadata_res = tokio::task::spawn_blocking(load_metadata).await;
     let metadata = match metadata_res {
         Ok(Ok(m)) => m,
         _ => {
@@ -1709,7 +1708,7 @@ async fn handle_proxy(
 
 async fn proxy_to_sandbox(id: &str, port: u16, path: &str) -> axum::response::Response {
     // Load metadata to get the sandbox IP
-    let metadata = match tokio::task::spawn_blocking(|| load_metadata()).await {
+    let metadata = match tokio::task::spawn_blocking(load_metadata).await {
         Ok(Ok(m)) => m,
         _ => {
             return axum::response::Response::builder()

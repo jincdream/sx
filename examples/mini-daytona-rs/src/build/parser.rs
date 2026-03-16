@@ -26,8 +26,8 @@ pub fn parse_dockerfile(path: &Path) -> anyhow::Result<Vec<Instruction>> {
             continue;
         }
 
-        if trimmed.ends_with('\\') {
-            current_line.push_str(&trimmed[..trimmed.len() - 1]);
+        if let Some(stripped) = trimmed.strip_suffix('\\') {
+            current_line.push_str(stripped);
             current_line.push(' ');
             continue;
         } else {

@@ -90,8 +90,7 @@ pub fn exec_sandbox(
     let redirect_dir = if is_python {
         let dir = format!("{}/tmp/_sandbox_pathfix", merged_dir_str);
         let _ = std::fs::create_dir_all(&dir);
-        let sc = format!(
-            r#"import os as _os, builtins as _bi
+        let sc = r#"import os as _os, builtins as _bi
 _M = _os.environ.get('_SANDBOX_MERGED_DIR', '')
 if _M:
     _orig = _bi.open
@@ -111,8 +110,7 @@ if _M:
                 f = alt
         return _iorig(f, *a, **k)
     _io.open = _rioopen
-"#
-        );
+"#;
         let _ = std::fs::write(format!("{}/sitecustomize.py", dir), sc);
         Some(dir)
     } else {
@@ -221,8 +219,7 @@ pub async fn exec_sandbox_stream(
     let redirect_dir = if is_python {
         let dir = format!("{}/tmp/_sandbox_pathfix", merged_dir_str);
         let _ = std::fs::create_dir_all(&dir);
-        let sc = format!(
-            r#"import os as _os, builtins as _bi
+        let sc = r#"import os as _os, builtins as _bi
 _M = _os.environ.get('_SANDBOX_MERGED_DIR', '')
 if _M:
     _orig = _bi.open
@@ -242,8 +239,7 @@ if _M:
                 f = alt
         return _iorig(f, *a, **k)
     _io.open = _rioopen
-"#
-        );
+"#;
         let _ = std::fs::write(format!("{}/sitecustomize.py", dir), sc);
         Some(dir)
     } else {

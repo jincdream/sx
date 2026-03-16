@@ -104,16 +104,16 @@ pub fn build(dockerfile_path: &Path, context_dir: &Path) -> Result<PathBuf> {
                 let _ = fs::remove_file(upper_dir.join("etc/resolv.conf"));
 
                 // Save to cache (skip if a concurrent build already populated it)
-                if !cache_layer.exists() {
-                    if fs::rename(&upper_dir, &cache_layer).is_err() {
-                        fs::create_dir_all(&cache_layer)?;
-                        let content_options = fs_extra::dir::CopyOptions {
-                            content_only: true,
-                            overwrite: true,
-                            ..Default::default()
-                        };
-                        fs_extra::dir::copy(&upper_dir, &cache_layer, &content_options)?;
-                    }
+                if !cache_layer.exists()
+                    && fs::rename(&upper_dir, &cache_layer).is_err()
+                {
+                    fs::create_dir_all(&cache_layer)?;
+                    let content_options = fs_extra::dir::CopyOptions {
+                        content_only: true,
+                        overwrite: true,
+                        ..Default::default()
+                    };
+                    fs_extra::dir::copy(&upper_dir, &cache_layer, &content_options)?;
                 }
                 lower_dirs.push(cache_layer);
 
@@ -159,16 +159,16 @@ pub fn build(dockerfile_path: &Path, context_dir: &Path) -> Result<PathBuf> {
 
                 overlay.unmount()?;
 
-                if !cache_layer.exists() {
-                    if fs::rename(&upper_dir, &cache_layer).is_err() {
-                        fs::create_dir_all(&cache_layer)?;
-                        let content_options = fs_extra::dir::CopyOptions {
-                            content_only: true,
-                            overwrite: true,
-                            ..Default::default()
-                        };
-                        fs_extra::dir::copy(&upper_dir, &cache_layer, &content_options)?;
-                    }
+                if !cache_layer.exists()
+                    && fs::rename(&upper_dir, &cache_layer).is_err()
+                {
+                    fs::create_dir_all(&cache_layer)?;
+                    let content_options = fs_extra::dir::CopyOptions {
+                        content_only: true,
+                        overwrite: true,
+                        ..Default::default()
+                    };
+                    fs_extra::dir::copy(&upper_dir, &cache_layer, &content_options)?;
                 }
                 lower_dirs.push(cache_layer);
 
