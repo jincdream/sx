@@ -1,0 +1,27 @@
+# Rust
+/target/
+.rustc_info.json
+# Cargo.lock — 本项目为二进制 crate，保留 Cargo.lock 以确保可复现构建
+
+# Node.js (for E2E tests)
+node_modules/
+package-lock.json
+
+# Environment Scratch/Temp Data
+/tmp/
+/my-moulin-volume/
+*.tar.gz
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon
+._*
+
+# IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+run_llm_e2e.js

@@ -1,0 +1,5 @@
+(version 1)
+(allow default)
+(deny file-write*)
+(allow file-write* (subpath "/Users/jinc.cen/jinc/open/sx/examples/moulin/test_sandbox"))
+(allow file-write* (subpath "/dev"))
