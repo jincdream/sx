@@ -1,5 +1,0 @@
-(version 1)
-(allow default)
-(deny file-write*)
-(allow file-write* (subpath "/Users/jinc.cen/jinc/open/sx/examples/mini-daytona-rs/test_sandbox"))
-(allow file-write* (subpath "/dev"))

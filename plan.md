@@ -1,4 +1,4 @@
-# mini-daytona-rs：极简容器运行时（Rust, Linux）
+# moulin：极简容器运行时（Rust, Linux）
 
 用 Rust 从零构建极简容器运行时。直接调用 Linux 内核 API 实现隔离，支持 **Dockerfile 构建** snapshot。本次更新全面引入 **OverlayFS**，不仅用于沙箱运行时的隔离，还用于实现类似 Docker 的**分层构建（Layered Build）与缓存机制**。
 
@@ -46,7 +46,7 @@
 ## 项目结构
 
 ```text
-examples/mini-daytona-rs/
+examples/moulin/
 ├── Cargo.toml
 ├── src/
 │   ├── main.rs              # CLI 入口
@@ -127,7 +127,7 @@ build(dockerfile_path, context_dir) → snapshot.tar.gz:
   3. 当前 Lower 层 = Layer 0
   4. for each instruction:
      - 计算当前指令的 Hash: `hash(Lower 层 Hash + Instruction 文本)`
-     - 检查缓存: 若 `~/.mini-daytona/cache/<Hash>` 存在，则跳过执行，更新 Lower 层 = 该缓存层。
+     - 检查缓存: 若 `~/.moulin/cache/<Hash>` 存在，则跳过执行，更新 Lower 层 = 该缓存层。
      - 若无缓存:
          - 创建工作区 `UpperDir` 和 `WorkDir`。
          - overlay.mount_overlay(Lower 层, UpperDir, WorkDir, MergedDir)
@@ -138,7 +138,7 @@ build(dockerfile_path, context_dir) → snapshot.tar.gz:
              - RUN: unshare(NEWNS|NEWPID) → fork → chroot(MergedDir) → exec(cmd)
              - ENTRYPOINT/CMD: 记录元数据
          - overlay.unmount_overlay(MergedDir)
-         - 将 `UpperDir` 移动并重命名为 `~/.mini-daytona/cache/<Hash>`，作为新的 Layer。
+         - 将 `UpperDir` 移动并重命名为 `~/.moulin/cache/<Hash>`，作为新的 Layer。
          - 更新 Lower 层为新计算出的组合视图。
   5. 遍历结束后，将最终的视图层结构打包：tar.gz(最终组合视图) → snapshot file
 
@@ -147,13 +147,13 @@ build(dockerfile_path, context_dir) → snapshot.tar.gz:
 ### `snapshot.rs`
 
 * `create_archive(source_dir, output_path)` / `extract_archive(archive_path, dest_dir)`
-* `extract_snapshot_base(snapshot_path)` → `~/.mini-daytona/bases/{hash}/`
+* `extract_snapshot_base(snapshot_path)` → `~/.moulin/bases/{hash}/`
 
 ### `overlay.rs`（增强支持多层）
 
 * `mount_overlay(lower_dirs: Vec<String>, upper_dir, work_dir, merged_dir)` → 拼接 `lowerdir=l1:l2:l3,upperdir=u,workdir=w` 并执行挂载。
 * `unmount_overlay(merged_dir)` → umount + cleanup
-* 运行时沙箱布局：`~/.mini-daytona/sandboxes/{id}/{upper,work,merged}/`
+* 运行时沙箱布局：`~/.moulin/sandboxes/{id}/{upper,work,merged}/`
 
 ### `sandbox.rs`
 
@@ -163,7 +163,7 @@ build(dockerfile_path, context_dir) → snapshot.tar.gz:
 ### `metadata.rs`
 
 * JSON 文件记录 snapshot 列表、sandbox 列表、entrypoint/env 以及 Layer 缓存映射等元数据
-* 存储于 `~/.mini-daytona/metadata/`
+* 存储于 `~/.moulin/metadata/`
 
 ---
 
@@ -181,18 +181,18 @@ COPY app.py /app/
 ENV APP_ENV=production
 ENTRYPOINT ["python3", "/app/app.py"]
 EOF
-echo 'print("Hello from mini-daytona!")' > /tmp/app.py
+echo 'print("Hello from moulin!")' > /tmp/app.py
 
-sudo ./target/release/mini-daytona-rs build /tmp/Dockerfile /tmp/
-# → 输出 snapshot: ~/.mini-daytona/snapshots/xxx.tar.gz
+sudo ./target/release/moulin build /tmp/Dockerfile /tmp/
+# → 输出 snapshot: ~/.moulin/snapshots/xxx.tar.gz
 
 # 重复执行上述 build 命令，观察输出，应当显示 "Using cache" 而瞬间完成，验证分层缓存生效。
 
 # === 方式 2: 从现有目录创建 ===
-sudo ./target/release/mini-daytona-rs snapshot ./my-rootfs output.tar.gz
+sudo ./target/release/moulin snapshot ./my-rootfs output.tar.gz
 
 # === 启动 sandbox ===
-sudo ./target/release/mini-daytona-rs start <snapshot.tar.gz>
+sudo ./target/release/moulin start <snapshot.tar.gz>
 # 进入隔离环境, 验证: python3 --version, ls /app/
 
 # === 验证 OverlayFS 隔离 ===

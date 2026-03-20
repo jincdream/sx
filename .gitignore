@@ -38,9 +38,9 @@ tmp/
 *.tmp
 *.log
 
-# ===== mini-daytona 运行时产物 =====
-# 本地运行时数据目录（在 ~/.mini-daytona/ 下，通常不会在项目内）
-.mini-daytona/
+# ===== moulin 运行时产物 =====
+# 本地运行时数据目录（在 ~/.moulin/ 下，通常不会在项目内）
+.moulin/
 
 # 构建过程中可能产生的快照文件
 *.tar.gz
