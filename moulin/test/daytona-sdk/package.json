@@ -1,0 +1,15 @@
+{
+  "name": "moulin-daytona-sdk-smoke",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "init": "npm install --cache .npm-cache",
+    "clean": "rm -rf node_modules package-lock.json .npm-cache",
+    "reinit": "npm run clean && npm run init",
+    "smoke": "tsx smoke.mts"
+  },
+  "dependencies": {
+    "@daytonaio/sdk": "^0.153.0",
+    "tsx": "^4.20.5"
+  }
+}

@@ -13,13 +13,15 @@ use crate::snapshot::{create_archive, get_sandboxes_dir, get_snapshots_dir, hard
 use axum::response::sse::{Event, Sse};
 use axum::response::{Html, IntoResponse};
 use axum::{
-    extract::{DefaultBodyLimit, Path, Query, State},
-    routing::{delete, get, post},
+    extract::{DefaultBodyLimit, Multipart, Path, Query, State},
+    http::{HeaderMap, StatusCode},
+    routing::{delete, get, post, put},
     Json, Router,
 };
 use chrono::Utc;
 use futures_util::stream::Stream;
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::path::{Path as FsPath, PathBuf};
@@ -71,6 +73,165 @@ pub struct StartRequest {
 #[derive(Serialize)]
 pub struct StartResponse {
     sandbox_id: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct SandboxCreateOptions {
+    name: Option<String>,
+    user: Option<String>,
+    env: std::collections::HashMap<String, String>,
+    labels: std::collections::HashMap<String, String>,
+    public: bool,
+    target: Option<String>,
+    network_block_all: bool,
+    network_allow_list: Option<String>,
+    auto_stop_interval: Option<u32>,
+    auto_archive_interval: Option<u32>,
+    auto_delete_interval: Option<u32>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct DaytonaCreateSandboxRequest {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    snapshot: Option<String>,
+    #[serde(default)]
+    user: Option<String>,
+    #[serde(default)]
+    env: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    labels: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    public: Option<bool>,
+    #[serde(default)]
+    network_block_all: Option<bool>,
+    #[serde(default)]
+    network_allow_list: Option<String>,
+    #[serde(default)]
+    target: Option<String>,
+    #[serde(default)]
+    cpu: Option<u64>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    gpu: Option<u64>,
+    #[serde(default)]
+    memory: Option<u64>,
+    #[serde(default)]
+    disk: Option<u64>,
+    #[serde(default)]
+    auto_stop_interval: Option<u32>,
+    #[serde(default)]
+    auto_archive_interval: Option<u32>,
+    #[serde(default)]
+    auto_delete_interval: Option<u32>,
+    #[serde(default)]
+    volumes: Vec<DaytonaVolumeMountRequest>,
+    #[serde(default)]
+    build_info: Option<DaytonaBuildInfoRequest>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct DaytonaBuildInfoRequest {
+    #[serde(default)]
+    dockerfile_content: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DaytonaVolumeMountRequest {
+    volume_id: String,
+    mount_path: String,
+    #[serde(default)]
+    subpath: Option<String>,
+    #[serde(default)]
+    readonly: bool,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct DaytonaSandboxListQuery {
+    #[serde(default)]
+    labels: Option<String>,
+    #[serde(default)]
+    states: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct DaytonaSandboxPaginatedQuery {
+    #[serde(default)]
+    page: Option<usize>,
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    labels: Option<String>,
+    #[serde(default)]
+    states: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DaytonaLabelsReplaceRequest {
+    labels: std::collections::HashMap<String, String>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct DaytonaSignedPreviewQuery {
+    #[serde(default)]
+    expires_in_seconds: Option<u64>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ToolboxExecuteRequest {
+    command: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    timeout: Option<u32>,
+    #[serde(default)]
+    cwd: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct ToolboxPathQuery {
+    #[serde(default)]
+    path: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ToolboxDeleteFileQuery {
+    path: String,
+}
+
+#[derive(Deserialize)]
+struct BulkDownloadRequest {
+    paths: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct ToolboxMoveFileQuery {
+    source: String,
+    destination: String,
+}
+
+#[derive(Deserialize)]
+struct ToolboxCreateFolderQuery {
+    path: String,
+    mode: String,
+}
+
+#[derive(Default)]
+struct PendingToolboxUpload {
+    path: Option<String>,
+    bytes: Option<Vec<u8>>,
 }
 
 #[derive(Deserialize)]
@@ -257,13 +418,56 @@ pub async fn run_server() -> anyhow::Result<()> {
         .route("/api/build", post(handle_build))
         .route("/api/build-cache", get(handle_build_cache_list))
         .route("/api/build-cache/prune", post(handle_build_cache_prune))
+        .route(
+            "/api/sandbox",
+            get(handle_daytona_list_sandboxes).post(handle_daytona_create_sandbox),
+        )
+        .route("/api/sandbox/paginated", get(handle_daytona_list_sandboxes_paginated))
+        .route(
+            "/api/sandbox/{id_or_name}",
+            get(handle_daytona_get_sandbox).delete(handle_daytona_delete_sandbox),
+        )
+        .route("/api/sandbox/{id_or_name}/start", post(handle_daytona_start_sandbox))
+        .route("/api/sandbox/{id_or_name}/stop", post(handle_daytona_stop_sandbox))
+        .route(
+            "/api/sandbox/{id_or_name}/labels",
+            put(handle_daytona_replace_sandbox_labels),
+        )
+        .route(
+            "/api/sandbox/{id_or_name}/toolbox-proxy-url",
+            get(handle_daytona_toolbox_proxy_url),
+        )
+        .route(
+            "/api/sandbox/{id_or_name}/ports/{port}/preview-url",
+            get(handle_daytona_preview_url),
+        )
+        .route(
+            "/api/sandbox/{id_or_name}/ports/{port}/signed-preview-url",
+            get(handle_daytona_signed_preview_url),
+        )
+        .route("/preview/{token}/{port}/sandbox-id", get(handle_daytona_preview_lookup))
+        .route("/toolbox/{sandbox_id}/process/execute", post(handle_toolbox_execute))
+        .route(
+            "/toolbox/{sandbox_id}/files",
+            get(handle_toolbox_list_files).delete(handle_toolbox_delete_file),
+        )
+        .route("/toolbox/{sandbox_id}/files/info", get(handle_toolbox_get_file_info))
+        .route("/toolbox/{sandbox_id}/files/download", get(handle_toolbox_download_file))
+        .route("/toolbox/{sandbox_id}/files/folder", post(handle_toolbox_create_folder))
+        .route("/toolbox/{sandbox_id}/files/move", post(handle_toolbox_move_file))
+        .route("/toolbox/{sandbox_id}/files/upload", post(handle_toolbox_upload_file))
+        .route(
+            "/toolbox/{sandbox_id}/files/bulk-upload",
+            post(handle_toolbox_bulk_upload),
+        )
+        .route("/toolbox/{sandbox_id}/files/bulk-download", post(handle_toolbox_bulk_download))
+        .route("/toolbox/{sandbox_id}/work-dir", get(handle_toolbox_work_dir))
         .route("/api/start", post(handle_start))
         .route("/api/snapshot", post(handle_snapshot))
         .route("/api/snapshots/from-sandbox", post(handle_snapshot_create_from_sandbox))
         .route("/api/snapshots/{id}", delete(handle_snapshot_delete))
         .route("/api/list", get(handle_list))
         .route("/api/e2e", post(handle_run_e2e))
-        .route("/api/sandbox/{id}", delete(handle_destroy))
         .route("/api/sandbox/{id}/info", get(handle_sandbox_info))
         .route("/api/sandbox/{id}/exec", post(handle_exec))
         .route("/api/sandbox/{id}/file", get(handle_file_read))
@@ -329,6 +533,278 @@ fn build_snapshot_from_paths(
         snapshot_path: snapshot_path.to_string_lossy().to_string(),
         snapshot_id,
     })
+}
+
+fn error_json(status: StatusCode, message: impl Into<String>) -> (StatusCode, Json<Value>) {
+    (status, Json(json!({ "message": message.into() })))
+}
+
+fn sandbox_name_matches(sandbox: &SandboxMetadata, id_or_name: &str) -> bool {
+    sandbox.id == id_or_name || sandbox.name.as_deref() == Some(id_or_name)
+}
+
+fn find_sandbox_by_id_or_name<'a>(
+    metadata: &'a crate::metadata::Metadata,
+    id_or_name: &str,
+) -> Option<&'a SandboxMetadata> {
+    metadata
+        .sandboxes
+        .values()
+        .find(|sandbox| sandbox_name_matches(sandbox, id_or_name))
+}
+
+fn request_base_url(headers: &HeaderMap) -> String {
+    let scheme = headers
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("http");
+    let host = headers
+        .get("host")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("localhost:3000");
+    format!("{}://{}", scheme, host)
+}
+
+fn sandbox_cpu_cores(resources: &ResourceLimits) -> u64 {
+    match (resources.cpu_quota, resources.cpu_period) {
+        (Some(quota), Some(period)) if period > 0 => std::cmp::max(1, quota / period),
+        _ => 1,
+    }
+}
+
+fn sandbox_memory_gib(resources: &ResourceLimits) -> u64 {
+    resources
+        .memory_bytes
+        .map(|bytes| std::cmp::max(1, bytes / 1024 / 1024 / 1024))
+        .unwrap_or(1)
+}
+
+fn sandbox_disk_gib(resources: &ResourceLimits) -> u64 {
+    resources
+        .disk_bytes
+        .map(|bytes| std::cmp::max(1, bytes / 1024 / 1024 / 1024))
+        .unwrap_or(2)
+}
+
+fn sandbox_to_daytona_value(sandbox: &SandboxMetadata, headers: &HeaderMap) -> Value {
+    let base_url = request_base_url(headers);
+    let mounts = sandbox
+        .mounts
+        .iter()
+        .map(|mount| {
+            json!({
+                "volumeId": mount.volume_id,
+                "mountPath": mount.mount_path,
+                "subpath": mount.subpath,
+                "readonly": mount.readonly,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    json!({
+        "id": sandbox.id,
+        "organizationId": "local",
+        "name": sandbox.name.clone().unwrap_or_else(|| sandbox.id.clone()),
+        "snapshot": sandbox.snapshot_id,
+        "user": sandbox.user,
+        "env": sandbox.env,
+        "labels": sandbox.labels,
+        "public": sandbox.public,
+        "networkBlockAll": sandbox.network_block_all,
+        "networkAllowList": sandbox.network_allow_list,
+        "target": sandbox.target,
+        "cpu": sandbox_cpu_cores(&sandbox.resources),
+        "gpu": 0,
+        "memory": sandbox_memory_gib(&sandbox.resources),
+        "disk": sandbox_disk_gib(&sandbox.resources),
+        "state": sandbox.state,
+        "autoStopInterval": sandbox.auto_stop_interval,
+        "autoArchiveInterval": sandbox.auto_archive_interval,
+        "autoDeleteInterval": sandbox.auto_delete_interval,
+        "volumes": mounts,
+        "createdAt": sandbox.created_at,
+        "updatedAt": sandbox.updated_at.clone().unwrap_or_else(|| sandbox.created_at.clone()),
+        "class": Value::Null,
+        "daemonVersion": "local",
+        "runnerId": "local",
+        "toolboxProxyUrl": format!("{}/toolbox", base_url),
+    })
+}
+
+fn resolve_snapshot_for_daytona_create(
+    request: &DaytonaCreateSandboxRequest,
+) -> anyhow::Result<(String, PathBuf)> {
+    let metadata = load_metadata()?;
+
+    if let Some(snapshot_ref) = &request.snapshot {
+        if let Some(snapshot) = metadata.snapshots.get(snapshot_ref) {
+            return Ok((snapshot.id.clone(), snapshot.path.clone()));
+        }
+
+        if let Some(snapshot) = metadata
+            .snapshots
+            .values()
+            .find(|snapshot| snapshot.name.as_deref() == Some(snapshot_ref.as_str()))
+        {
+            return Ok((snapshot.id.clone(), snapshot.path.clone()));
+        }
+
+        let snapshot_path = PathBuf::from(snapshot_ref);
+        if snapshot_path.exists() {
+            let snapshot_id = metadata
+                .snapshots
+                .values()
+                .find(|snapshot| snapshot.path == snapshot_path)
+                .map(|snapshot| snapshot.id.clone())
+                .unwrap_or_default();
+            return Ok((snapshot_id, snapshot_path));
+        }
+
+        anyhow::bail!("Snapshot {} not found", snapshot_ref);
+    }
+
+    if let Some(build_info) = &request.build_info {
+        if let Some(dockerfile_content) = &build_info.dockerfile_content {
+            let temp_dir = std::env::temp_dir().join(format!("moulin-daytona-build-{}", Uuid::new_v4()));
+            std::fs::create_dir_all(&temp_dir)?;
+            let dockerfile_path = temp_dir.join("Dockerfile");
+            std::fs::write(&dockerfile_path, dockerfile_content)?;
+            let build = build_snapshot_from_paths(
+                dockerfile_path,
+                temp_dir,
+                request.name.clone(),
+                Some("Built from Daytona buildInfo".to_string()),
+            )?;
+            return Ok((build.snapshot_id, PathBuf::from(build.snapshot_path)));
+        }
+    }
+
+    let language = request
+        .labels
+        .get("code-toolbox-language")
+        .cloned()
+        .unwrap_or_else(|| "python".to_string());
+
+    let image_name = match language.as_str() {
+        "typescript" | "javascript" | "node" => "nextjs",
+        "vue" | "vue3" | "vite" => "vue3-vite",
+        "analysis" | "data-analysis" => "data-analysis",
+        "puppeteer" => "puppeteer",
+        "nginx" => "nginx",
+        _ => "python",
+    };
+
+    if let Some(snapshot) = metadata
+        .snapshots
+        .values()
+        .filter(|snapshot| snapshot.name.as_deref() == Some(image_name))
+        .max_by(|left, right| left.created_at.cmp(&right.created_at))
+    {
+        return Ok((snapshot.id.clone(), snapshot.path.clone()));
+    }
+
+    let image_dir = resolve_image_dir(image_name)?;
+    let build = build_snapshot_from_paths(
+        image_dir.join("Dockerfile"),
+        image_dir,
+        Some(image_name.to_string()),
+        Some("Auto-built for Daytona compatibility".to_string()),
+    )?;
+    Ok((build.snapshot_id, PathBuf::from(build.snapshot_path)))
+}
+
+fn start_sandbox_instance(
+    snapshot_path: PathBuf,
+    snapshot_id: String,
+    resource_limits: ResourceLimits,
+    mount_configs: Vec<MountConfig>,
+    options: SandboxCreateOptions,
+) -> anyhow::Result<SandboxMetadata> {
+    let sandbox_id = Uuid::new_v4().to_string();
+    let sandbox_dir = get_sandboxes_dir()?.join(&sandbox_id);
+
+    let metadata = load_metadata()?;
+    let bind_mounts: Vec<BindMount> = mount_configs
+        .iter()
+        .map(|mc| {
+            let volume = metadata
+                .volumes
+                .get(&mc.volume_id)
+                .ok_or_else(|| anyhow::anyhow!("Volume {} not found", mc.volume_id))?;
+            if !mc.mount_path.starts_with('/') {
+                anyhow::bail!("mount_path must be absolute: {}", mc.mount_path);
+            }
+            if mc.mount_path.contains("..") {
+                anyhow::bail!("mount_path must not contain '..': {}", mc.mount_path);
+            }
+            if mc.subpath.as_deref().is_some_and(|value| value.split('/').any(|part| part == "..")) {
+                anyhow::bail!("subpath must not contain '..'");
+            }
+            Ok(BindMount {
+                host_path: match &mc.subpath {
+                    Some(subpath) if !subpath.is_empty() => volume.path.join(subpath),
+                    _ => volume.path.clone(),
+                },
+                container_path: mc.mount_path.clone(),
+                readonly: mc.readonly,
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+
+    let upper_dir = sandbox_dir.join("upper");
+    let work_dir = sandbox_dir.join("work");
+    let merged_dir = sandbox_dir.join("merged");
+
+    std::fs::create_dir_all(&upper_dir)?;
+
+    let overlay = OverlayMount::new(vec![snapshot_path], upper_dir, work_dir, merged_dir.clone())?;
+    overlay.mount()?;
+
+    let sandbox = SandboxMetadata {
+        id: sandbox_id.clone(),
+        snapshot_id,
+        created_at: Utc::now().to_rfc3339(),
+        dir: sandbox_dir.clone(),
+        pid: None,
+        ip: None,
+        resources: resource_limits.clone(),
+        mounts: mount_configs,
+        name: options.name,
+        state: "started".to_string(),
+        user: options.user,
+        env: options.env,
+        labels: options.labels,
+        public: options.public,
+        target: options.target,
+        network_block_all: options.network_block_all,
+        network_allow_list: options.network_allow_list,
+        auto_stop_interval: options.auto_stop_interval,
+        auto_archive_interval: options.auto_archive_interval,
+        auto_delete_interval: options.auto_delete_interval,
+        updated_at: Some(Utc::now().to_rfc3339()),
+    };
+
+    let mut writable_metadata = load_metadata()?;
+    writable_metadata.sandboxes.insert(sandbox_id.clone(), sandbox.clone());
+    save_metadata(&writable_metadata)?;
+
+    let local_sandbox_id = sandbox_id;
+    std::thread::spawn(move || {
+        info!("Starting sandbox execution: {}", local_sandbox_id);
+        if let Err(e) = run_sandbox(
+            &local_sandbox_id,
+            merged_dir.to_str().unwrap(),
+            &["tail", "-f", "/dev/null"],
+            Some(&resource_limits),
+            None,
+            SandboxProfile::Runtime,
+            &bind_mounts,
+        ) {
+            error!("Sandbox {} failed: {}", local_sandbox_id, e);
+        }
+    });
+
+    Ok(sandbox)
 }
 
 async fn handle_admin_page() -> Html<&'static str> {
@@ -434,10 +910,14 @@ fn resolve_file_path(
             if relative.split('/').any(|c| c == "..") {
                 anyhow::bail!("Path contains '..' traversal component");
             }
+            let volume_root = match &mount.subpath {
+                Some(subpath) if !subpath.is_empty() => volume.path.join(subpath),
+                _ => volume.path.clone(),
+            };
             let target = if relative.is_empty() {
-                volume.path.clone()
+                volume_root
             } else {
-                volume.path.join(relative)
+                volume_root.join(relative)
             };
             return Ok(target);
         }
@@ -456,6 +936,839 @@ fn is_readonly_mount(sandbox: &SandboxMetadata, user_path: &str) -> bool {
         }
     }
     false
+}
+
+fn parse_label_filter(raw: &Option<String>) -> anyhow::Result<std::collections::HashMap<String, String>> {
+    match raw {
+        Some(value) if !value.trim().is_empty() => Ok(serde_json::from_str(value)?),
+        _ => Ok(std::collections::HashMap::new()),
+    }
+}
+
+fn sandbox_matches_filter(
+    sandbox: &SandboxMetadata,
+    labels: &std::collections::HashMap<String, String>,
+    states: &[String],
+    name: &Option<String>,
+) -> bool {
+    if !labels.iter().all(|(key, value)| sandbox.labels.get(key) == Some(value)) {
+        return false;
+    }
+
+    if !states.is_empty() && !states.iter().any(|state| state == &sandbox.state) {
+        return false;
+    }
+
+    if let Some(name_filter) = name {
+        let sandbox_name = sandbox.name.as_deref().unwrap_or(&sandbox.id);
+        if sandbox_name != name_filter {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn file_info_value(path: &std::path::Path) -> anyhow::Result<Value> {
+    let metadata = std::fs::metadata(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(json!({
+            "name": path.file_name().and_then(|value| value.to_str()).unwrap_or_default(),
+            "isDir": metadata.is_dir(),
+            "size": metadata.len(),
+            "modTime": chrono::DateTime::<chrono::Utc>::from(metadata.modified()?).to_rfc3339(),
+            "mode": if metadata.is_dir() { "drwxr-xr-x" } else { "-rw-r--r--" },
+            "permissions": format!("{:04o}", metadata.mode() & 0o7777),
+            "owner": metadata.uid().to_string(),
+            "group": metadata.gid().to_string(),
+        }))
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(json!({
+            "name": path.file_name().and_then(|value| value.to_str()).unwrap_or_default(),
+            "isDir": metadata.is_dir(),
+            "size": metadata.len(),
+            "modTime": chrono::DateTime::<chrono::Utc>::from(metadata.modified()?).to_rfc3339(),
+            "mode": if metadata.is_dir() { "dir" } else { "file" },
+            "permissions": "0644",
+            "owner": "unknown",
+            "group": "unknown",
+        }))
+    }
+}
+
+fn ensure_parent_dir(path: &std::path::Path) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    Ok(())
+}
+
+fn write_file_bytes(path: &std::path::Path, bytes: &[u8]) -> anyhow::Result<()> {
+    ensure_parent_dir(path)?;
+    std::fs::write(path, bytes)?;
+    Ok(())
+}
+
+fn copy_path_recursive(source: &std::path::Path, destination: &std::path::Path) -> anyhow::Result<()> {
+    let metadata = std::fs::symlink_metadata(source)?;
+    if metadata.is_dir() {
+        std::fs::create_dir_all(destination)?;
+        for entry in std::fs::read_dir(source)? {
+            let entry = entry?;
+            copy_path_recursive(&entry.path(), &destination.join(entry.file_name()))?;
+        }
+        return Ok(());
+    }
+
+    ensure_parent_dir(destination)?;
+    std::fs::copy(source, destination)?;
+    Ok(())
+}
+
+fn move_path(source: &std::path::Path, destination: &std::path::Path) -> anyhow::Result<()> {
+    ensure_parent_dir(destination)?;
+    match std::fs::rename(source, destination) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            copy_path_recursive(source, destination)?;
+            if source.is_dir() {
+                std::fs::remove_dir_all(source)?;
+            } else {
+                std::fs::remove_file(source)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn extract_toolbox_upload_index(name: &str) -> Option<&str> {
+    name.strip_prefix("files[")?.split_once(']')?.0.into()
+}
+
+fn collect_toolbox_uploads(
+    mut multipart: Multipart,
+) -> impl std::future::Future<Output = Result<Vec<(String, Vec<u8>)>, (StatusCode, Json<Value>)>> {
+    async move {
+        let mut pending = std::collections::BTreeMap::<String, PendingToolboxUpload>::new();
+
+        while let Some(field) = multipart
+            .next_field()
+            .await
+            .map_err(|error| error_json(StatusCode::BAD_REQUEST, error.to_string()))?
+        {
+            let Some(name) = field.name().map(str::to_string) else {
+                continue;
+            };
+
+            if let Some(index) = extract_toolbox_upload_index(&name) {
+                let entry = pending.entry(index.to_string()).or_default();
+                if name.ends_with("].path") {
+                    let path = field
+                        .text()
+                        .await
+                        .map_err(|error| error_json(StatusCode::BAD_REQUEST, error.to_string()))?;
+                    entry.path = Some(path);
+                } else if name.ends_with("].file") {
+                    let bytes = field
+                        .bytes()
+                        .await
+                        .map_err(|error| error_json(StatusCode::BAD_REQUEST, error.to_string()))?;
+                    entry.bytes = Some(bytes.to_vec());
+                }
+            }
+        }
+
+        let uploads = pending
+            .into_iter()
+            .map(|(index, pending)| {
+                let path = pending.path.ok_or_else(|| {
+                    error_json(StatusCode::BAD_REQUEST, format!("files[{index}].path is required"))
+                })?;
+                let bytes = pending.bytes.ok_or_else(|| {
+                    error_json(StatusCode::BAD_REQUEST, format!("files[{index}].file is required"))
+                })?;
+                Ok((path, bytes))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        if uploads.is_empty() {
+            return Err(error_json(StatusCode::BAD_REQUEST, "No files uploaded"));
+        }
+
+        Ok(uploads)
+    }
+}
+
+async fn handle_daytona_create_sandbox(
+    headers: HeaderMap,
+    Json(payload): Json<DaytonaCreateSandboxRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let sandbox = tokio::task::spawn_blocking(move || {
+        let (snapshot_id, snapshot_path) = resolve_snapshot_for_daytona_create(&payload)?;
+        let mounts = payload
+            .volumes
+            .into_iter()
+            .map(|mount| MountConfig {
+                volume_id: mount.volume_id,
+                mount_path: mount.mount_path,
+                subpath: mount.subpath,
+                readonly: mount.readonly,
+            })
+            .collect::<Vec<_>>();
+
+        let mut resources = ResourceLimits::default();
+        if let Some(cpu) = payload.cpu {
+            resources.cpu_period = Some(100_000);
+            resources.cpu_quota = Some(cpu.saturating_mul(100_000));
+        }
+        if let Some(memory) = payload.memory {
+            resources.memory_bytes = Some(memory.saturating_mul(1024 * 1024 * 1024));
+        }
+        if let Some(disk) = payload.disk {
+            resources.disk_bytes = Some(disk.saturating_mul(1024 * 1024 * 1024));
+        }
+
+        start_sandbox_instance(
+            snapshot_path,
+            snapshot_id,
+            resources,
+            mounts,
+            SandboxCreateOptions {
+                name: payload.name,
+                user: payload.user,
+                env: payload.env,
+                labels: payload.labels,
+                public: payload.public.unwrap_or(false),
+                target: payload.target,
+                network_block_all: payload.network_block_all.unwrap_or(false),
+                network_allow_list: payload.network_allow_list,
+                auto_stop_interval: payload.auto_stop_interval,
+                auto_archive_interval: payload.auto_archive_interval,
+                auto_delete_interval: payload.auto_delete_interval,
+            },
+        )
+    })
+    .await
+    .map_err(|error| error_json(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+    .map_err(|error| error_json(StatusCode::BAD_REQUEST, error.to_string()))?;
+
+    Ok(Json(sandbox_to_daytona_value(&sandbox, &headers)))
+}
+
+async fn handle_daytona_list_sandboxes(
+    headers: HeaderMap,
+    Query(query): Query<DaytonaSandboxListQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let labels = parse_label_filter(&query.labels)
+        .map_err(|error| error_json(StatusCode::BAD_REQUEST, error.to_string()))?;
+    let states = query
+        .states
+        .unwrap_or_default()
+        .split(',')
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| value.trim().to_string())
+        .collect::<Vec<_>>();
+
+    let sandboxes = tokio::task::spawn_blocking(load_metadata)
+        .await
+        .map_err(|error| error_json(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .map_err(|error| error_json(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .sandboxes
+        .into_values()
+        .filter(|sandbox| sandbox_matches_filter(sandbox, &labels, &states, &query.name))
+        .map(|sandbox| sandbox_to_daytona_value(&sandbox, &headers))
+        .collect::<Vec<_>>();
+
+    Ok(Json(Value::Array(sandboxes)))
+}
+
+async fn handle_daytona_list_sandboxes_paginated(
+    headers: HeaderMap,
+    Query(query): Query<DaytonaSandboxPaginatedQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let labels = parse_label_filter(&query.labels)
+        .map_err(|error| error_json(StatusCode::BAD_REQUEST, error.to_string()))?;
+    let states = query
+        .states
+        .unwrap_or_default()
+        .split(',')
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| value.trim().to_string())
+        .collect::<Vec<_>>();
+
+    let page = query.page.unwrap_or(1).max(1);
+    let limit = query.limit.unwrap_or(20).max(1);
+
+    let mut sandboxes = tokio::task::spawn_blocking(load_metadata)
+        .await
+        .map_err(|error| error_json(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .map_err(|error| error_json(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .sandboxes
+        .into_values()
+        .filter(|sandbox| sandbox_matches_filter(sandbox, &labels, &states, &query.name))
+        .collect::<Vec<_>>();
+
+    sandboxes.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+    let total = sandboxes.len();
+    let total_pages = if total == 0 { 0 } else { total.div_ceil(limit) };
+    let start = (page - 1) * limit;
+    let items = sandboxes
+        .into_iter()
+        .skip(start)
+        .take(limit)
+        .map(|sandbox| sandbox_to_daytona_value(&sandbox, &headers))
+        .collect::<Vec<_>>();
+
+    Ok(Json(json!({
+        "items": items,
+        "total": total,
+        "page": page,
+        "totalPages": total_pages,
+    })))
+}
+
+async fn handle_daytona_get_sandbox(
+    headers: HeaderMap,
+    Path(id_or_name): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let metadata = tokio::task::spawn_blocking(load_metadata)
+        .await
+        .map_err(|error| error_json(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .map_err(|error| error_json(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let sandbox = find_sandbox_by_id_or_name(&metadata, &id_or_name)
+        .ok_or_else(|| error_json(StatusCode::NOT_FOUND, format!("Sandbox {} not found", id_or_name)))?;
+    Ok(Json(sandbox_to_daytona_value(sandbox, &headers)))
+}
+
+async fn handle_daytona_delete_sandbox(
+    headers: HeaderMap,
+    Path(id_or_name): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let sandbox = tokio::task::spawn_blocking(move || {
+        let mut metadata = load_metadata()?;
+        let sandbox = metadata
+            .sandboxes
+            .values()
+            .find(|sandbox| sandbox_name_matches(sandbox, &id_or_name))
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("Sandbox {} not found", id_or_name))?;
+        metadata.sandboxes.remove(&sandbox.id);
+        let merged_dir = sandbox.dir.join("merged");
+        crate::os::sys::destroy_sandbox_os(&sandbox, &merged_dir);
+        std::fs::remove_dir_all(&sandbox.dir)?;
+        save_metadata(&metadata)?;
+        Ok::<_, anyhow::Error>(sandbox)
+    })
+    .await
+    .map_err(|error| error_json(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+    .map_err(|error| error_json(StatusCode::NOT_FOUND, error.to_string()))?;
+
+    Ok(Json(sandbox_to_daytona_value(&sandbox, &headers)))
+}
+
+async fn handle_daytona_start_sandbox(
+    headers: HeaderMap,
+    Path(id_or_name): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let sandbox = tokio::task::spawn_blocking(move || {
+        let mut metadata = load_metadata()?;
+        let sandbox_id = metadata
+            .sandboxes
+            .values()
+            .find(|sandbox| sandbox_name_matches(sandbox, &id_or_name))
+            .map(|sandbox| sandbox.id.clone())
+            .ok_or_else(|| anyhow::anyhow!("Sandbox {} not found", id_or_name))?;
+        let sandbox = metadata
+            .sandboxes
+            .get_mut(&sandbox_id)
+            .ok_or_else(|| anyhow::anyhow!("Sandbox {} not found", sandbox_id))?;
+        crate::os::sys::resume_sandbox_os(sandbox, &sandbox.dir.join("merged"))?;
+        sandbox.state = "started".to_string();
+        sandbox.updated_at = Some(Utc::now().to_rfc3339());
+        let result = sandbox.clone();
+        save_metadata(&metadata)?;
+        Ok::<_, anyhow::Error>(result)
+    })
+    .await
+    .map_err(|error| error_json(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+    .map_err(|error| error_json(StatusCode::BAD_REQUEST, error.to_string()))?;
+
+    Ok(Json(sandbox_to_daytona_value(&sandbox, &headers)))
+}
+
+async fn handle_daytona_stop_sandbox(
+    headers: HeaderMap,
+    Path(id_or_name): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let sandbox = tokio::task::spawn_blocking(move || {
+        let mut metadata = load_metadata()?;
+        let sandbox_id = metadata
+            .sandboxes
+            .values()
+            .find(|sandbox| sandbox_name_matches(sandbox, &id_or_name))
+            .map(|sandbox| sandbox.id.clone())
+            .ok_or_else(|| anyhow::anyhow!("Sandbox {} not found", id_or_name))?;
+        let sandbox = metadata
+            .sandboxes
+            .get_mut(&sandbox_id)
+            .ok_or_else(|| anyhow::anyhow!("Sandbox {} not found", sandbox_id))?;
+        crate::os::sys::suspend_sandbox_os(sandbox, &sandbox.dir.join("merged"))?;
+        sandbox.state = "stopped".to_string();
+        sandbox.updated_at = Some(Utc::now().to_rfc3339());
+        let result = sandbox.clone();
+        save_metadata(&metadata)?;
+        Ok::<_, anyhow::Error>(result)
+    })
+    .await
+    .map_err(|error| error_json(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+    .map_err(|error| error_json(StatusCode::BAD_REQUEST, error.to_string()))?;
+
+    Ok(Json(sandbox_to_daytona_value(&sandbox, &headers)))
+}
+
+async fn handle_daytona_replace_sandbox_labels(
+    Path(id_or_name): Path<String>,
+    Json(payload): Json<DaytonaLabelsReplaceRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let labels = tokio::task::spawn_blocking(move || {
+        let mut metadata = load_metadata()?;
+        let sandbox_id = metadata
+            .sandboxes
+            .values()
+            .find(|sandbox| sandbox_name_matches(sandbox, &id_or_name))
+            .map(|sandbox| sandbox.id.clone())
+            .ok_or_else(|| anyhow::anyhow!("Sandbox {} not found", id_or_name))?;
+        let sandbox = metadata
+            .sandboxes
+            .get_mut(&sandbox_id)
+            .ok_or_else(|| anyhow::anyhow!("Sandbox {} not found", sandbox_id))?;
+        sandbox.labels = payload.labels;
+        sandbox.updated_at = Some(Utc::now().to_rfc3339());
+        let labels = sandbox.labels.clone();
+        save_metadata(&metadata)?;
+        Ok::<_, anyhow::Error>(labels)
+    })
+    .await
+    .map_err(|error| error_json(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+    .map_err(|error| error_json(StatusCode::BAD_REQUEST, error.to_string()))?;
+
+    Ok(Json(json!({ "labels": labels })))
+}
+
+async fn handle_daytona_toolbox_proxy_url(
+    headers: HeaderMap,
+    Path(id_or_name): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let metadata = tokio::task::spawn_blocking(load_metadata)
+        .await
+        .map_err(|error| error_json(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .map_err(|error| error_json(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    find_sandbox_by_id_or_name(&metadata, &id_or_name)
+        .ok_or_else(|| error_json(StatusCode::NOT_FOUND, format!("Sandbox {} not found", id_or_name)))?;
+    Ok(Json(json!({
+        "url": format!("{}/toolbox", request_base_url(&headers)),
+    })))
+}
+
+async fn handle_daytona_preview_url(
+    headers: HeaderMap,
+    Path((id_or_name, port)): Path<(String, u16)>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let metadata = tokio::task::spawn_blocking(load_metadata)
+        .await
+        .map_err(|error| error_json(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .map_err(|error| error_json(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let sandbox = find_sandbox_by_id_or_name(&metadata, &id_or_name)
+        .ok_or_else(|| error_json(StatusCode::NOT_FOUND, format!("Sandbox {} not found", id_or_name)))?;
+    Ok(Json(json!({
+        "sandboxId": sandbox.id,
+        "port": port,
+        "token": sandbox.id,
+        "url": format!("{}/api/sandbox/{}/proxy/{}", request_base_url(&headers), sandbox.id, port),
+    })))
+}
+
+async fn handle_daytona_signed_preview_url(
+    headers: HeaderMap,
+    Path((id_or_name, port)): Path<(String, u16)>,
+    Query(query): Query<DaytonaSignedPreviewQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let metadata = tokio::task::spawn_blocking(load_metadata)
+        .await
+        .map_err(|error| error_json(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .map_err(|error| error_json(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let sandbox = find_sandbox_by_id_or_name(&metadata, &id_or_name)
+        .ok_or_else(|| error_json(StatusCode::NOT_FOUND, format!("Sandbox {} not found", id_or_name)))?;
+    let token = format!("{}.{}", sandbox.id, Uuid::new_v4());
+    Ok(Json(json!({
+        "sandboxId": sandbox.id,
+        "port": port,
+        "token": token,
+        "expiresInSeconds": query.expires_in_seconds.unwrap_or(60),
+        "url": format!("{}/api/sandbox/{}/proxy/{}", request_base_url(&headers), sandbox.id, port),
+    })))
+}
+
+async fn handle_daytona_preview_lookup(
+    Path((token, _port)): Path<(String, u16)>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let sandbox_id = token
+        .split_once('.')
+        .map(|(sandbox_id, _)| sandbox_id.to_string())
+        .unwrap_or(token);
+    if sandbox_id.is_empty() {
+        return Err(error_json(StatusCode::BAD_REQUEST, "Invalid preview token"));
+    }
+    Ok(Json(json!({ "sandboxId": sandbox_id })))
+}
+
+async fn handle_toolbox_execute(
+    Path(sandbox_id): Path<String>,
+    Json(payload): Json<ToolboxExecuteRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if payload.command.trim().is_empty() {
+        return Err(error_json(StatusCode::BAD_REQUEST, "command is required"));
+    }
+
+    let result = tokio::task::spawn_blocking(move || {
+        let metadata = load_metadata()?;
+        let sandbox = metadata
+            .sandboxes
+            .get(&sandbox_id)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("Sandbox {} not found", sandbox_id))?;
+        let snapshot_env = metadata
+            .snapshots
+            .get(&sandbox.snapshot_id)
+            .and_then(|snapshot| snapshot.env.clone())
+            .unwrap_or_default();
+        let command = if let Some(cwd) = payload.cwd.filter(|cwd| !cwd.trim().is_empty()) {
+            let escaped_cwd = cwd.replace('"', "\\\"");
+            vec![
+                "sh".to_string(),
+                "-lc".to_string(),
+                format!("cd \"{}\" && {}", escaped_cwd, payload.command),
+            ]
+        } else {
+            vec!["sh".to_string(), "-lc".to_string(), payload.command]
+        };
+        let output = crate::os::sys::exec_sandbox(&sandbox, &command, &snapshot_env)?;
+        Ok::<_, anyhow::Error>(json!({
+            "exitCode": output.status.code().unwrap_or(-1),
+            "result": String::from_utf8_lossy(&output.stdout).to_string() + &String::from_utf8_lossy(&output.stderr),
+        }))
+    })
+    .await
+    .map_err(|error| error_json(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+    .map_err(|error| error_json(StatusCode::BAD_REQUEST, error.to_string()))?;
+
+    Ok(Json(result))
+}
+
+async fn handle_toolbox_list_files(
+    Path(sandbox_id): Path<String>,
+    Query(query): Query<ToolboxPathQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let result = tokio::task::spawn_blocking(move || {
+        let metadata = load_metadata()?;
+        let sandbox = metadata
+            .sandboxes
+            .get(&sandbox_id)
+            .ok_or_else(|| anyhow::anyhow!("Sandbox {} not found", sandbox_id))?;
+        let path = query.path.unwrap_or_else(|| ".".to_string());
+        let target = resolve_file_path(sandbox, &metadata, &path)?;
+        let files = std::fs::read_dir(target)?
+            .filter_map(|entry| entry.ok())
+            .filter_map(|entry| file_info_value(&entry.path()).ok())
+            .collect::<Vec<_>>();
+        Ok::<_, anyhow::Error>(Value::Array(files))
+    })
+    .await
+    .map_err(|error| error_json(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+    .map_err(|error| error_json(StatusCode::BAD_REQUEST, error.to_string()))?;
+
+    Ok(Json(result))
+}
+
+async fn handle_toolbox_get_file_info(
+    Path(sandbox_id): Path<String>,
+    Query(query): Query<ToolboxDeleteFileQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let result = tokio::task::spawn_blocking(move || {
+        let metadata = load_metadata()?;
+        let sandbox = metadata
+            .sandboxes
+            .get(&sandbox_id)
+            .ok_or_else(|| anyhow::anyhow!("Sandbox {} not found", sandbox_id))?;
+        let target = resolve_file_path(sandbox, &metadata, &query.path)?;
+        file_info_value(&target)
+    })
+    .await
+    .map_err(|error| error_json(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+    .map_err(|error| error_json(StatusCode::BAD_REQUEST, error.to_string()))?;
+
+    Ok(Json(result))
+}
+
+async fn handle_toolbox_delete_file(
+    Path(sandbox_id): Path<String>,
+    Query(query): Query<ToolboxDeleteFileQuery>,
+) -> Result<StatusCode, (StatusCode, Json<Value>)> {
+    tokio::task::spawn_blocking(move || {
+        let metadata = load_metadata()?;
+        let sandbox = metadata
+            .sandboxes
+            .get(&sandbox_id)
+            .ok_or_else(|| anyhow::anyhow!("Sandbox {} not found", sandbox_id))?;
+        if is_readonly_mount(sandbox, &query.path) {
+            anyhow::bail!("Cannot delete from read-only volume mount");
+        }
+        let target = resolve_file_path(sandbox, &metadata, &query.path)?;
+        if target.is_dir() {
+            std::fs::remove_dir_all(target)?;
+        } else {
+            std::fs::remove_file(target)?;
+        }
+        Ok::<_, anyhow::Error>(())
+    })
+    .await
+    .map_err(|error| error_json(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+    .map_err(|error| error_json(StatusCode::BAD_REQUEST, error.to_string()))?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn handle_toolbox_create_folder(
+    Path(sandbox_id): Path<String>,
+    Query(query): Query<ToolboxCreateFolderQuery>,
+) -> Result<StatusCode, (StatusCode, Json<Value>)> {
+    tokio::task::spawn_blocking(move || {
+        let metadata = load_metadata()?;
+        let sandbox = metadata
+            .sandboxes
+            .get(&sandbox_id)
+            .ok_or_else(|| anyhow::anyhow!("Sandbox {} not found", sandbox_id))?;
+        if is_readonly_mount(sandbox, &query.path) {
+            anyhow::bail!("Cannot create folder in read-only volume mount");
+        }
+        let target = resolve_file_path(sandbox, &metadata, &query.path)?;
+        std::fs::create_dir_all(&target)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(mode) = u32::from_str_radix(query.mode.trim_start_matches('0'), 8) {
+                std::fs::set_permissions(&target, std::fs::Permissions::from_mode(mode))?;
+            }
+        }
+        Ok::<_, anyhow::Error>(())
+    })
+    .await
+    .map_err(|error| error_json(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+    .map_err(|error| error_json(StatusCode::BAD_REQUEST, error.to_string()))?;
+
+    Ok(StatusCode::OK)
+}
+
+async fn handle_toolbox_move_file(
+    Path(sandbox_id): Path<String>,
+    Query(query): Query<ToolboxMoveFileQuery>,
+) -> Result<StatusCode, (StatusCode, Json<Value>)> {
+    tokio::task::spawn_blocking(move || {
+        let metadata = load_metadata()?;
+        let sandbox = metadata
+            .sandboxes
+            .get(&sandbox_id)
+            .ok_or_else(|| anyhow::anyhow!("Sandbox {} not found", sandbox_id))?;
+        if is_readonly_mount(sandbox, &query.source) || is_readonly_mount(sandbox, &query.destination) {
+            anyhow::bail!("Cannot move files into or out of a read-only volume mount");
+        }
+        let source = resolve_file_path(sandbox, &metadata, &query.source)?;
+        let destination = resolve_file_path(sandbox, &metadata, &query.destination)?;
+        move_path(&source, &destination)
+    })
+    .await
+    .map_err(|error| error_json(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+    .map_err(|error| error_json(StatusCode::BAD_REQUEST, error.to_string()))?;
+
+    Ok(StatusCode::OK)
+}
+
+async fn handle_toolbox_upload_file(
+    Path(sandbox_id): Path<String>,
+    Query(query): Query<ToolboxDeleteFileQuery>,
+    mut multipart: Multipart,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let mut file_bytes = None;
+
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|error| error_json(StatusCode::BAD_REQUEST, error.to_string()))?
+    {
+        if field.name() == Some("file") {
+            let bytes = field
+                .bytes()
+                .await
+                .map_err(|error| error_json(StatusCode::BAD_REQUEST, error.to_string()))?;
+            file_bytes = Some(bytes.to_vec());
+            break;
+        }
+    }
+
+    let bytes = file_bytes.ok_or_else(|| error_json(StatusCode::BAD_REQUEST, "file is required"))?;
+
+    tokio::task::spawn_blocking(move || {
+        let metadata = load_metadata()?;
+        let sandbox = metadata
+            .sandboxes
+            .get(&sandbox_id)
+            .ok_or_else(|| anyhow::anyhow!("Sandbox {} not found", sandbox_id))?;
+        if is_readonly_mount(sandbox, &query.path) {
+            anyhow::bail!("Cannot upload to read-only volume mount");
+        }
+        let target = resolve_file_path(sandbox, &metadata, &query.path)?;
+        write_file_bytes(&target, &bytes)
+    })
+    .await
+    .map_err(|error| error_json(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+    .map_err(|error| error_json(StatusCode::BAD_REQUEST, error.to_string()))?;
+
+    Ok(Json(json!({})))
+}
+
+async fn handle_toolbox_bulk_upload(
+    Path(sandbox_id): Path<String>,
+    multipart: Multipart,
+) -> Result<StatusCode, (StatusCode, Json<Value>)> {
+    let uploads = collect_toolbox_uploads(multipart).await?;
+
+    tokio::task::spawn_blocking(move || {
+        let metadata = load_metadata()?;
+        let sandbox = metadata
+            .sandboxes
+            .get(&sandbox_id)
+            .ok_or_else(|| anyhow::anyhow!("Sandbox {} not found", sandbox_id))?;
+
+        for (path, bytes) in uploads {
+            if is_readonly_mount(sandbox, &path) {
+                anyhow::bail!("Cannot upload to read-only volume mount: {}", path);
+            }
+            let target = resolve_file_path(sandbox, &metadata, &path)?;
+            write_file_bytes(&target, &bytes)?;
+        }
+
+        Ok::<_, anyhow::Error>(())
+    })
+    .await
+    .map_err(|error| error_json(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+    .map_err(|error| error_json(StatusCode::BAD_REQUEST, error.to_string()))?;
+
+    Ok(StatusCode::OK)
+}
+
+async fn handle_toolbox_download_file(
+    Path(sandbox_id): Path<String>,
+    Query(query): Query<ToolboxDeleteFileQuery>,
+) -> Result<impl IntoResponse, (StatusCode, Json<Value>)> {
+    let bytes = tokio::task::spawn_blocking(move || {
+        let metadata = load_metadata()?;
+        let sandbox = metadata
+            .sandboxes
+            .get(&sandbox_id)
+            .ok_or_else(|| anyhow::anyhow!("Sandbox {} not found", sandbox_id))?;
+        let target = resolve_file_path(sandbox, &metadata, &query.path)?;
+        Ok::<_, anyhow::Error>(std::fs::read(target)?)
+    })
+    .await
+    .map_err(|error| error_json(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+    .map_err(|error| error_json(StatusCode::BAD_REQUEST, error.to_string()))?;
+
+    Ok(([(axum::http::header::CONTENT_TYPE, "application/octet-stream")], bytes))
+}
+
+async fn handle_toolbox_work_dir(Path(sandbox_id): Path<String>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let metadata = tokio::task::spawn_blocking(load_metadata)
+        .await
+        .map_err(|error| error_json(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .map_err(|error| error_json(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    if !metadata.sandboxes.contains_key(&sandbox_id) {
+        return Err(error_json(StatusCode::NOT_FOUND, format!("Sandbox {} not found", sandbox_id)));
+    }
+    Ok(Json(json!({ "dir": "/" })))
+}
+
+async fn handle_toolbox_bulk_download(
+    Path(sandbox_id): Path<String>,
+    Json(payload): Json<BulkDownloadRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<Value>)> {
+    let parts = tokio::task::spawn_blocking(move || {
+        let metadata = load_metadata()?;
+        let sandbox = metadata
+            .sandboxes
+            .get(&sandbox_id)
+            .ok_or_else(|| anyhow::anyhow!("Sandbox {} not found", sandbox_id))?;
+        let mut results: Vec<(String, Result<Vec<u8>, String>)> = Vec::new();
+        for path in &payload.paths {
+            match resolve_file_path(sandbox, &metadata, path) {
+                Ok(target) => match std::fs::read(&target) {
+                    Ok(bytes) => results.push((path.clone(), Ok(bytes))),
+                    Err(e) => results.push((path.clone(), Err(e.to_string()))),
+                },
+                Err(e) => results.push((path.clone(), Err(e.to_string()))),
+            }
+        }
+        Ok::<_, anyhow::Error>(results)
+    })
+    .await
+    .map_err(|error| error_json(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+    .map_err(|error| error_json(StatusCode::BAD_REQUEST, error.to_string()))?;
+
+    // Build multipart/form-data response compatible with busboy
+    let boundary = format!("boundary{}", uuid::Uuid::new_v4().simple());
+    let mut body = Vec::new();
+    for (path, result) in &parts {
+        match result {
+            Ok(bytes) => {
+                body.extend_from_slice(format!("--{}\r\n", boundary).as_bytes());
+                body.extend_from_slice(
+                    format!(
+                        "Content-Disposition: form-data; name=\"file\"; filename=\"{}\"\r\n",
+                        path
+                    )
+                    .as_bytes(),
+                );
+                body.extend_from_slice(b"Content-Type: application/octet-stream\r\n\r\n");
+                body.extend_from_slice(bytes);
+                body.extend_from_slice(b"\r\n");
+            }
+            Err(msg) => {
+                body.extend_from_slice(format!("--{}\r\n", boundary).as_bytes());
+                body.extend_from_slice(
+                    format!(
+                        "Content-Disposition: form-data; name=\"error\"; filename=\"{}\"\r\n",
+                        path
+                    )
+                    .as_bytes(),
+                );
+                body.extend_from_slice(b"Content-Type: text/plain\r\n\r\n");
+                body.extend_from_slice(msg.as_bytes());
+                body.extend_from_slice(b"\r\n");
+            }
+        }
+    }
+    body.extend_from_slice(format!("--{}--\r\n", boundary).as_bytes());
+
+    Ok((
+        [(
+            axum::http::header::CONTENT_TYPE,
+            format!("multipart/form-data; boundary={}", boundary),
+        )],
+        body,
+    ))
 }
 
 async fn handle_info() -> Json<ApiResponse<ServerInfoResponse>> {
@@ -683,10 +1996,6 @@ async fn handle_start(
     let result: anyhow::Result<StartResponse> = tokio::task::spawn_blocking(move || {
         let snapshot_path = PathBuf::from(payload.snapshot);
         let resource_limits = payload.resources.unwrap_or_default();
-        let mount_configs = payload.mounts;
-        let sandbox_id = Uuid::new_v4().to_string();
-        let sandbox_dir = get_sandboxes_dir()?.join(&sandbox_id);
-
         let metadata = load_metadata()?;
         let snapshot_id = metadata
             .snapshots
@@ -696,76 +2005,17 @@ async fn handle_start(
             .map(|snapshot| snapshot.id.clone())
             .unwrap_or_default();
 
-        // Resolve and validate volume mounts
-        let bind_mounts: Vec<BindMount> = mount_configs
-            .iter()
-            .map(|mc| {
-                let volume = metadata
-                    .volumes
-                    .get(&mc.volume_id)
-                    .ok_or_else(|| anyhow::anyhow!("Volume {} not found", mc.volume_id))?;
-                if !mc.mount_path.starts_with('/') {
-                    anyhow::bail!("mount_path must be absolute: {}", mc.mount_path);
-                }
-                if mc.mount_path.contains("..") {
-                    anyhow::bail!("mount_path must not contain '..': {}", mc.mount_path);
-                }
-                Ok(BindMount {
-                    host_path: volume.path.clone(),
-                    container_path: mc.mount_path.clone(),
-                    readonly: mc.readonly,
-                })
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?;
+        let sandbox = start_sandbox_instance(
+            snapshot_path,
+            snapshot_id,
+            resource_limits,
+            payload.mounts,
+            SandboxCreateOptions::default(),
+        )?;
 
-        let upper_dir = sandbox_dir.join("upper");
-        let work_dir = sandbox_dir.join("work");
-        let merged_dir = sandbox_dir.join("merged");
-
-        std::fs::create_dir_all(&upper_dir)?;
-
-        let overlay =
-            OverlayMount::new(vec![snapshot_path], upper_dir, work_dir, merged_dir.clone())?;
-        overlay.mount()?;
-
-        let mut metadata = load_metadata()?;
-        metadata.sandboxes.insert(
-            sandbox_id.clone(),
-            SandboxMetadata {
-                id: sandbox_id.clone(),
-                snapshot_id,
-                created_at: Utc::now().to_rfc3339(),
-                dir: sandbox_dir.clone(),
-                pid: None,
-                ip: None,
-                resources: resource_limits.clone(),
-                mounts: mount_configs,
-            },
-        );
-        save_metadata(&metadata)?;
-
-        let local_sandbox_id = sandbox_id.clone();
-
-        // Spawn the blocking sandbox process in another thread so we can return the ID
-        std::thread::spawn(move || {
-            info!("Starting sandbox execution: {}", local_sandbox_id);
-            // Use an infinite sleep so the primary container process doesn't exit immediately
-            let sid = local_sandbox_id.clone();
-            if let Err(e) = run_sandbox(
-                &sid,
-                merged_dir.to_str().unwrap(),
-                &["tail", "-f", "/dev/null"],
-                Some(&resource_limits),
-                None,
-                SandboxProfile::Runtime,
-                &bind_mounts,
-            ) {
-                error!("Sandbox {} failed: {}", local_sandbox_id, e);
-            }
-            // We do not unmount here, we leave it to handle_destroy so the user can interact via API.
-        });
-
-        Ok(StartResponse { sandbox_id })
+        Ok(StartResponse {
+            sandbox_id: sandbox.id,
+        })
     })
     .await
     .unwrap_or_else(|e| Err(anyhow::anyhow!("Task panic: {}", e)));
@@ -950,37 +2200,7 @@ async fn handle_snapshot_delete(Path(id): Path<String>) -> Json<ApiResponse<Snap
     }
 }
 
-async fn handle_destroy(Path(id): Path<String>) -> Json<ApiResponse<String>> {
-    let result = tokio::task::spawn_blocking(move || {
-        let mut metadata = load_metadata()?;
-        if let Some(sandbox) = metadata.sandboxes.remove(&id) {
-            let merged_dir = sandbox.dir.join("merged");
 
-            crate::os::sys::destroy_sandbox_os(&sandbox, &merged_dir);
-
-            std::fs::remove_dir_all(&sandbox.dir)?;
-            save_metadata(&metadata)?;
-            Ok(format!("Destroyed sandbox {}", id))
-        } else {
-            anyhow::bail!("Sandbox {} not found", id);
-        }
-    })
-    .await
-    .unwrap_or_else(|e| Err(anyhow::anyhow!("Task panic: {}", e)));
-
-    match result {
-        Ok(data) => Json(ApiResponse {
-            success: true,
-            data: Some(data),
-            error: None,
-        }),
-        Err(e) => Json(ApiResponse {
-            success: false,
-            data: None,
-            error: Some(e.to_string()),
-        }),
-    }
-}
 
 #[derive(Serialize)]
 pub struct SandboxInfoResponse {

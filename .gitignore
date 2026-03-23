@@ -37,6 +37,7 @@
 tmp/
 *.tmp
 *.log
+.npm-cache
 
 # ===== moulin 运行时产物 =====
 # 本地运行时数据目录（在 ~/.moulin/ 下，通常不会在项目内）

@@ -18,7 +18,7 @@ chrono = "0.4"
 anyhow = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-axum = "0.8.8"
+axum = { version = "0.8.8", features = ["multipart"] }
 tokio = { version = "1.49.0", features = ["rt", "rt-multi-thread", "macros", "net", "process", "io-util"] }
 libc = "0.2"
 base64 = "0.22"

@@ -35,6 +35,9 @@ pub struct MountConfig {
     pub volume_id: String,
     /// Absolute path inside the container, e.g. "/data"
     pub mount_path: String,
+    /// Optional subdirectory within the volume to mount.
+    #[serde(default)]
+    pub subpath: Option<String>,
     /// Mount the volume read-only (default: false)
     #[serde(default)]
     pub readonly: bool,
@@ -56,6 +59,36 @@ pub struct SandboxMetadata {
     /// Volumes mounted into this sandbox
     #[serde(default)]
     pub mounts: Vec<MountConfig>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default = "default_sandbox_state")]
+    pub state: String,
+    #[serde(default)]
+    pub user: Option<String>,
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+    #[serde(default)]
+    pub labels: HashMap<String, String>,
+    #[serde(default)]
+    pub public: bool,
+    #[serde(default)]
+    pub target: Option<String>,
+    #[serde(default)]
+    pub network_block_all: bool,
+    #[serde(default)]
+    pub network_allow_list: Option<String>,
+    #[serde(default)]
+    pub auto_stop_interval: Option<u32>,
+    #[serde(default)]
+    pub auto_archive_interval: Option<u32>,
+    #[serde(default)]
+    pub auto_delete_interval: Option<u32>,
+    #[serde(default)]
+    pub updated_at: Option<String>,
+}
+
+fn default_sandbox_state() -> String {
+    "started".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

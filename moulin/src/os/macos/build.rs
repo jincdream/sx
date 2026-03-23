@@ -1,6 +1,35 @@
 use std::path::Path;
 use tracing::info;
 
+fn prepare_root_symlink_targets(merged_dir: &Path) -> anyhow::Result<()> {
+    let entries = match std::fs::read_dir(merged_dir) {
+        Ok(entries) => entries,
+        Err(_) => return Ok(()),
+    };
+
+    for entry in entries {
+        let entry = entry?;
+        let entry_path = entry.path();
+        let metadata = std::fs::symlink_metadata(&entry_path)?;
+        if !metadata.file_type().is_symlink() {
+            continue;
+        }
+
+        let target = std::fs::read_link(&entry_path)?;
+        if target.is_absolute()
+            || target
+                .components()
+                .any(|component| matches!(component, std::path::Component::ParentDir))
+        {
+            continue;
+        }
+
+        std::fs::create_dir_all(merged_dir.join(target))?;
+    }
+
+    Ok(())
+}
+
 pub fn get_cache_key_ext() -> Option<String> {
     // Include host Python version so the global artifact cache invalidates
     // when Python is upgraded — native C-extension .so files are version-specific.
@@ -46,6 +75,7 @@ pub fn build_instruction(
         merged_dir.join(workdir.trim_start_matches('/'))
     };
     std::fs::create_dir_all(&actual_workdir)?;
+    prepare_root_symlink_targets(merged_dir)?;
 
     // Discover Python site-packages inside the image so pip installs
     // packages into the merged_dir instead of the host, and so that
